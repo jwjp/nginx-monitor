@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { decideLag, decidePid, decideUrl, initialPidState, initialUrlState } from '../src/decide.js';
+import {
+  decideLag,
+  decidePid,
+  decideProbe,
+  decideUrl,
+  initialPidState,
+  initialUrlState,
+  mergeRestarts,
+  recoverAfter,
+} from '../src/decide.js';
 
 const URL = 'http://127.0.0.1/nginx_status';
 
@@ -160,6 +169,88 @@ test('down and a bad page are different alerts, and the next good sample recover
   const back = decideUrl(bad.state, { type: 'ok', url: URL, sample: sample({ requests: 101 }) }, config(), 180_000);
   assert.equal(back.events.some((event) => event.kind === 'bad_status_page' && event.recovery), true);
   assert.equal(back.record.state, 'ok');
+});
+
+test('a flapping gauge stays open until enough clear samples in a row', () => {
+  const held = config({ activeConnectionsThreshold: 10, recoverAfterSamples: 3 });
+  let state = initialUrlState();
+  let at = 0;
+  let accepts = 100;
+  const step = (active) => {
+    at += 60_000;
+    accepts += 1;
+    const result = decideUrl(
+      state,
+      { type: 'ok', url: URL, sample: sample({ active, accepts, handled: accepts }) },
+      held,
+      at,
+    );
+    state = result.state;
+    return result.events.filter((event) => event.kind === 'active');
+  };
+
+  assert.equal(step(12)[0].recovery, false);
+  assert.deepEqual(step(5), []);
+  assert.deepEqual(step(5), []);
+  // A firing sample inside the hold restarts the clear count.
+  assert.equal(step(12)[0].recovery, false);
+  assert.equal(state.open.active, true);
+  assert.deepEqual(step(5), []);
+  assert.deepEqual(step(5), []);
+  const recovered = step(5);
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].recovery, true);
+  assert.equal(state.open.active, false);
+});
+
+test('a reopened condition recovers on the next clear sample', () => {
+  const held = config({ recoverAfterSamples: 3 });
+  let { state } = decideUrl(initialUrlState(), { type: 'down', url: URL }, held, 0);
+  for (let i = 1; i <= 3; i += 1) {
+    ({ state } = decideUrl(state, { type: 'ok', url: URL, sample: sample() }, held, i * 60_000));
+  }
+  assert.equal(state.open.down, false);
+  // The recovery post failed, so the cycle reopens the condition.
+  state.open.down = true;
+  const again = decideUrl(state, { type: 'ok', url: URL, sample: sample() }, held, 240_000);
+  assert.equal(again.events.some((event) => event.kind === 'down' && event.recovery), true);
+});
+
+test('recoverAfter falls back to 1 for a missing or invalid value', () => {
+  assert.equal(recoverAfter({}), 1);
+  assert.equal(recoverAfter({ recoverAfterSamples: 0 }), 1);
+  assert.equal(recoverAfter({ recoverAfterSamples: 4 }), 4);
+});
+
+test('a probe recovery waits for the hold', () => {
+  const url = 'http://127.0.0.1/health';
+  const failed = decideProbe(false, { ok: false, status: 502 }, url, { hold: 2 });
+  assert.equal(failed.open, true);
+  const first = decideProbe(failed.open, { ok: true, status: 200 }, url, {
+    hold: 2,
+    clearStreak: failed.clearStreak,
+  });
+  assert.equal(first.open, true);
+  assert.deepEqual(first.events, []);
+  const second = decideProbe(first.open, { ok: true, status: 200 }, url, {
+    hold: 2,
+    clearStreak: first.clearStreak,
+  });
+  assert.equal(second.open, false);
+  assert.equal(second.events[0].recovery, true);
+});
+
+test('a pid change is folded into the counter restart of the same cycle', () => {
+  const urlRestart = { scope: 'url', kind: 'restart', target: URL, reason: 'counters moved backward' };
+  const pidRestart = { scope: 'pid', kind: 'restart', target: 'nginx-pid', reason: 'master pid changed from 1 to 2' };
+  const merged = mergeRestarts([urlRestart, pidRestart]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].reason, 'counters moved backward; master pid changed from 1 to 2');
+
+  // Without a counter restart the pid change still posts on its own.
+  const alone = mergeRestarts([{ ...pidRestart }]);
+  assert.equal(alone.length, 1);
+  assert.equal(alone[0].target, 'nginx-pid');
 });
 
 test('a missing pid file alerts once until it is readable, and a new pid is a restart', () => {

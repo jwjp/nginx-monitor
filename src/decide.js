@@ -17,7 +17,15 @@ export function initialUrlState() {
       writing: false,
       stall: false,
     },
+    clearStreak: {},
   };
+}
+
+// A condition that flaps around its threshold would otherwise send an
+// incident and a recovery every cycle, because a recovery clears the throttle.
+export function recoverAfter(config) {
+  const value = config?.recoverAfterSamples;
+  return Number.isInteger(value) && value >= 1 ? value : 1;
 }
 
 function cloneState(state) {
@@ -27,6 +35,7 @@ function cloneState(state) {
     quietSamples: state.quietSamples,
     missedCycles: state.missedCycles,
     open: { ...state.open },
+    clearStreak: { ...(state.clearStreak ?? {}) },
   };
 }
 
@@ -56,10 +65,15 @@ function release(next, events, kind, target, url) {
 function setFailure(next, events, kind, target, url, reason, extra = {}) {
   alert(events, { scope: 'url', url, kind, target, reason, ...extra });
   next.open[kind] = true;
+  next.clearStreak[kind] = 0;
 }
 
-function clearFailure(next, events, kind, target, url, reason) {
+// The streak is not reset on recovery. If the recovery post fails and the
+// condition is reopened, the next clear sample recovers it again at once.
+function clearFailure(next, events, kind, target, url, reason, hold = 1) {
   if (!next.open[kind]) return;
+  next.clearStreak[kind] = (next.clearStreak[kind] ?? 0) + 1;
+  if (next.clearStreak[kind] < hold) return;
   recover(events, { scope: 'url', url, kind, target, reason });
   next.open[kind] = false;
 }
@@ -72,6 +86,7 @@ function evaluateGauges(next, events, counts, config, target, url) {
     label: 'active connections',
     target,
     url,
+    hold: recoverAfter(config),
   });
   evaluateGauge(next, events, {
     kind: 'waiting',
@@ -80,6 +95,7 @@ function evaluateGauges(next, events, counts, config, target, url) {
     label: 'waiting connections',
     target,
     url,
+    hold: recoverAfter(config),
   });
   evaluateGauge(next, events, {
     kind: 'reading',
@@ -88,6 +104,7 @@ function evaluateGauges(next, events, counts, config, target, url) {
     label: 'reading connections',
     target,
     url,
+    hold: recoverAfter(config),
   });
   evaluateGauge(next, events, {
     kind: 'writing',
@@ -96,16 +113,17 @@ function evaluateGauges(next, events, counts, config, target, url) {
     label: 'writing connections',
     target,
     url,
+    hold: recoverAfter(config),
   });
 }
 
-function evaluateGauge(next, events, { kind, threshold, value, label, target, url }) {
+function evaluateGauge(next, events, { kind, threshold, value, label, target, url, hold }) {
   const firing = threshold > 0 && value >= threshold;
   if (firing) {
     setFailure(next, events, kind, target, url, `${label} ${value} reached ${threshold}`);
     return;
   }
-  clearFailure(next, events, kind, target, url, `${label} ${value} are below ${threshold}`);
+  clearFailure(next, events, kind, target, url, `${label} ${value} are below ${threshold}`, hold);
 }
 
 // Every stub_status fetch and every probe is itself counted in `requests`, so
@@ -127,7 +145,7 @@ function evaluateStall(next, events, requestsDelta, config, target, url) {
   if (requestsDelta > ownRequests(next, config, url)) {
     next.seenBusySample = true;
     next.quietSamples = 0;
-    clearFailure(next, events, 'stall', target, url, 'requests are moving');
+    clearFailure(next, events, 'stall', target, url, 'requests are moving', recoverAfter(config));
     return;
   }
   if (next.seenBusySample) {
@@ -180,8 +198,9 @@ export function decideUrl(state, observation, config, at) {
     return { state: next, events, record: { url, state: 'bad_status_page', restart: false } };
   }
 
-  clearFailure(next, events, 'down', target, url, 'stub_status is reachable');
-  clearFailure(next, events, 'bad_status_page', target, url, 'stub_status page is valid');
+  const hold = recoverAfter(config);
+  clearFailure(next, events, 'down', target, url, 'stub_status is reachable', hold);
+  clearFailure(next, events, 'bad_status_page', target, url, 'stub_status page is valid', hold);
 
   const counts = countsOf(observation.sample);
   if (!next.lastGood) {
@@ -234,6 +253,7 @@ export function decideUrl(state, observation, config, at) {
       target,
       url,
       `dropped connections fell below ${config.droppedConnectionsMin}`,
+      hold,
     );
   }
 
@@ -293,19 +313,23 @@ export function decideLag(open, skipped, min) {
   return { open: false, events: [] };
 }
 
-export function decideProbe(open, result, url) {
+export function decideProbe(open, result, url, { hold = 1, clearStreak = 0 } = {}) {
   const target = stripUserinfo(url);
   const statusText = result.status == null ? 'error' : String(result.status);
   const reason = `${statusText} ${target}`;
   if (result.ok) {
-    if (!open) return { open: false, events: [] };
+    if (!open) return { open: false, clearStreak, events: [] };
+    const streak = clearStreak + 1;
+    if (streak < hold) return { open: true, clearStreak: streak, events: [] };
     return {
       open: false,
+      clearStreak: streak,
       events: [recoverEvent('probe', target, reason)],
     };
   }
   return {
     open: true,
+    clearStreak: 0,
     events: [{
       scope: 'probe',
       kind: 'probe',
@@ -414,4 +438,14 @@ export function decidePid(state, result) {
     masterPid: result.pid,
     events,
   };
+}
+
+// stub_status counters reset and the master pid changes on the same restart.
+// Fold the pid change into the counter restart so one restart posts once.
+export function mergeRestarts(events) {
+  const pidRestart = events.find((event) => event.scope === 'pid' && event.kind === 'restart');
+  const urlRestarts = events.filter((event) => event.scope === 'url' && event.kind === 'restart');
+  if (!pidRestart || urlRestarts.length === 0) return events;
+  for (const event of urlRestarts) event.reason = `${event.reason}; ${pidRestart.reason}`;
+  return events.filter((event) => event !== pidRestart);
 }

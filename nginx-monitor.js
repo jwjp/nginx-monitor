@@ -9,6 +9,8 @@ import {
   decidePid,
   decideProbe,
   decideUrl,
+  mergeRestarts,
+  recoverAfter,
   initialPidState,
   initialUrlState,
 } from './src/decide.js';
@@ -31,6 +33,7 @@ export function createContext(config, overrides = {}) {
     config,
     urlStates: new Map(config.statusUrls.map((url) => [url, initialUrlState()])),
     probeOpen: false,
+    probeClearStreak: 0,
     configTestOpen: false,
     pidState: initialPidState(),
     sent: {},
@@ -117,8 +120,12 @@ async function runCycleBody(ctx) {
       ranges: config.probeAcceptedStatuses,
       fetchImpl: ctx.fetchImpl,
     });
-    const decided = decideProbe(ctx.probeOpen, result, config.probeUrl);
+    const decided = decideProbe(ctx.probeOpen, result, config.probeUrl, {
+      hold: recoverAfter(config),
+      clearStreak: ctx.probeClearStreak ?? 0,
+    });
     ctx.probeOpen = decided.open;
+    ctx.probeClearStreak = decided.clearStreak;
     probe = { ok: result.ok, status: result.status };
     events.push(...decided.events);
   }
@@ -143,9 +150,10 @@ async function runCycleBody(ctx) {
     events.push(...decided.events);
   }
 
-  for (const event of events) event.at ??= at;
+  const merged = mergeRestarts(events);
+  for (const event of merged) event.at ??= at;
   ctx.undelivered ??= {};
-  const ordered = orderDeliveries(events, ctx.undelivered);
+  const ordered = orderDeliveries(merged, ctx.undelivered);
   const holdRecovery = new Set();
   let sentCount = 0;
   let slackUnavailable = false;
@@ -258,10 +266,13 @@ async function listenStatusServer(config) {
 // A stuck cycle must not hold SIGTERM until systemd sends SIGKILL.
 export const SHUTDOWN_WAIT_MS = 30_000;
 
-export async function stop({ server, task, ctx, timeoutMs = SHUTDOWN_WAIT_MS } = {}) {
-  if (task && typeof task.stop === 'function') {
-    task.stop();
-  }
+// Reads the state lazily: a signal can arrive during the first cycle, before
+// the cron task exists, and `start` must then not schedule one.
+export async function stop(state = {}) {
+  const timeoutMs = state.timeoutMs ?? SHUTDOWN_WAIT_MS;
+  state.stopping = true;
+  state.task?.stop?.();
+  const { ctx } = state;
   if (ctx && ctx.running) {
     const startWait = Date.now();
     while (ctx.running && Date.now() - startWait < timeoutMs) {
@@ -269,6 +280,7 @@ export async function stop({ server, task, ctx, timeoutMs = SHUTDOWN_WAIT_MS } =
     }
     if (ctx.running) console.error('shutdown timed out while a cycle was still running');
   }
+  const { server } = state;
   if (server && typeof server.close === 'function') {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(() => resolve()));
@@ -317,6 +329,8 @@ export async function start(env = process.env, signalOptions = {}) {
   }
 
   const ctx = createContext(config);
+  const state = { server, task: null, ctx };
+  const unregister = registerSignalHandlers(state, signalOptions);
   try {
     await runCycle(ctx);
   } catch (error) {
@@ -324,18 +338,20 @@ export async function start(env = process.env, signalOptions = {}) {
     if (config.runOnce) process.exit(1);
   }
   if (config.runOnce) process.exit(0);
+  if (state.stopping) return { ...state, unregister };
 
-  const task = cron.schedule(config.cronSchedule, () => {
+  // Overlap is handled by runCycle, which counts the tick as skipped for the
+  // lag alert. node-cron's noOverlap would drop that tick uncounted if the
+  // callback ever returned the cycle promise.
+  state.task = cron.schedule(config.cronSchedule, () => {
     runCycle(ctx).catch((error) => {
       console.error(`cycle failed: ${error.message}`);
     });
   }, {
     timezone: config.cronTimezone,
-    noOverlap: true,
   });
 
-  const unregister = registerSignalHandlers({ server, task, ctx }, signalOptions);
-  return { server, task, ctx, unregister };
+  return { ...state, unregister };
 }
 
 function invokedDirectly() {

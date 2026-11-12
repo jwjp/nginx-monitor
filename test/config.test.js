@@ -107,6 +107,15 @@ test('counts the monitor own requests per status origin', () => {
   assert.equal(loadConfig(env({ SKIPPED_CYCLES_MIN: '0' })).skippedCyclesMin, 0);
 });
 
+test('RECOVER_AFTER_SAMPLES is a whole number of at least 1', () => {
+  assert.equal(loadConfig(env()).recoverAfterSamples, 3);
+  assert.equal(loadConfig(env({ RECOVER_AFTER_SAMPLES: '1' })).recoverAfterSamples, 1);
+  assert.equal(loadConfig(env({ RECOVER_AFTER_SAMPLES: '5' })).recoverAfterSamples, 5);
+  assert.equal(loadConfig(env({ RECOVER_AFTER_SAMPLES: '0' })).recoverAfterSamples, 3);
+  assert.equal(loadConfig(env({ RECOVER_AFTER_SAMPLES: '2.5' })).recoverAfterSamples, 3);
+  assert.equal(loadConfig(env({ RECOVER_AFTER_SAMPLES: 'x' })).recoverAfterSamples, 3);
+});
+
 test('rejects a six-field cron expression', () => {
   assert.throws(() => loadConfig(env({ CRON_SCHEDULE: '*/10 * * * * *' })), ConfigError);
 });

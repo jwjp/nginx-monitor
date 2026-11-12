@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import http from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { registerSignalHandlers, stop } from '../nginx-monitor.js';
+import { registerSignalHandlers, start, stop } from '../nginx-monitor.js';
 
 test('stop calls task.stop, waits for the running cycle, then closes the server', async () => {
   const order = [];
@@ -85,4 +89,41 @@ test('registerSignalHandlers handles SIGINT and SIGTERM and stops once', async (
   unregister();
   assert.equal(fakeProcess.listenerCount('SIGINT'), 0);
   assert.equal(fakeProcess.listenerCount('SIGTERM'), 0);
+});
+
+test('a signal during the first cycle waits for it and does not schedule cron', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'nginx-monitor-start-'));
+  let release;
+  const server = http.createServer((req, res) => {
+    release = () => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('Active connections: 1\nserver accepts handled requests\n 1 1 1\nReading: 0 Writing: 1 Waiting: 0\n');
+    };
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const fakeProcess = new EventEmitter();
+  let exited = 0;
+  try {
+    const started = start({
+      SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T/B/X',
+      STATUS_URL: `http://127.0.0.1:${server.address().port}/nginx_status`,
+      STATUS_LOG_FILE: path.join(dir, 'status-history.json'),
+      WEB_ENABLED: 'false',
+    }, { processObj: fakeProcess, onExit: () => { exited += 1; } });
+    while (!release) await new Promise((resolve) => setTimeout(resolve, 5));
+    fakeProcess.emit('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(exited, 0);
+    release();
+    const state = await started;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(state.task, null);
+    assert.equal(state.stopping, true);
+    assert.equal(exited, 1);
+    state.unregister();
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
 });

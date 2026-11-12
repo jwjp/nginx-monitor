@@ -61,7 +61,7 @@ Alert decisions, `stub_status` parsing, URL checks, throttle transitions, and to
 3. Take one sample immediately, then schedule the cycle.
 4. A cycle fetches every status URL, updates deltas, optionally probes, optionally runs `nginx -t`, optionally reads the pid file, decides alerts, sends Slack, and appends one history snapshot. If a cycle is still running when the next one is due, count a skip and return without fetching. The skip is reported by the next cycle that runs.
 5. A finished cycle is success even when NGINX is down. Exit 1 only for invalid configuration, an uncaught exception, or a `RUN_ONCE` cycle that throws. `RUN_ONCE` still exits 0 when the cycle completes and alerts were sent.
-6. On `SIGINT` or `SIGTERM`, stop the cron timer, wait up to 30 seconds for any in-flight cycle to complete, close the status server, and exit 0. A cycle still running after that wait does not block exit.
+6. On `SIGINT` or `SIGTERM`, stop the cron timer, wait up to 30 seconds for any in-flight cycle to complete, close the status server, and exit 0. A cycle still running after that wait does not block exit. Register the handlers before the first sample. A signal during that sample waits for it, and the cron timer is never started.
 7. Log the schedule, time zone, status URLs, and which optional checks are enabled. Never log the webhook, the status token, or a URL userinfo field.
 
 ## stub_status
@@ -105,7 +105,7 @@ Track each status URL independently. `STATUS_URL` is required. `STATUS_URLS` add
 
 `NGINX_TEST_ENABLED` defaults to false. When true, run `execFile(NGINX_BIN, ["-t"])` with an argument array and a timeout. Never use a shell string. Success is exit code 0. `nginx -t` writes "syntax is ok" to stderr on success. Ignore stderr on success. On failure, a Slack message may include stderr trimmed to 300 characters. The history file stores only `ok: false`.
 
-`NGINX_PID_FILE` empty means the pid check is off. When set, read the file and accept a single integer. A change from the previous pid emits `restart`. A missing or malformed file emits one configuration alert. Do not signal the process.
+`NGINX_PID_FILE` empty means the pid check is off. When set, read the file and accept a single integer. A change from the previous pid emits `restart`. When a status URL emits a counter `restart` in the same cycle, the pid change is appended to that restart reason and does not post separately, because both describe one NGINX restart. A missing or malformed file emits one configuration alert. Do not signal the process.
 
 ## URL guard
 
@@ -126,6 +126,8 @@ Accept only an `https` URL whose host is `hooks.slack.com` and whose path starts
 Send one message per alert event. Use a short header prefixed with `[nginx]`, the target label, the UTC timestamp, and the reason. Do not include the webhook URL. Escape `&`, `<`, and `>` in the target and the reason, because Slack reads them as links and mentions and `nginx -t` stderr can echo config text.
 
 Throttle key is `${target}::${kind}`. While a condition remains true, skip a send when the same key was sent inside `THROTTLE_DURATION_MS`. A recovery for that target and kind deletes the key, so a later incident sends immediately. Recovery messages are not throttled away. `restart` is an event, not a condition that stays true, so every restart sends and is never throttled. A crash loop still sends at most one restart per target per cycle.
+
+`RECOVER_AFTER_SAMPLES` defaults to 3. A `stub_status` condition (`down`, `bad_status_page`, `dropped`, the four gauges, and `stall`) or the probe recovers only after that many consecutive samples in which it is false. A sample in which it is true again restarts the count, and while the condition stays open its repeats are throttled. Without this, a value that flaps around a threshold sends an incident and a recovery every cycle, because each recovery clears the throttle. A switch between `down` and `bad_status_page` is not a recovery and is not held. `config_test`, the pid-file alert, and `lag` recover on the first good sample. If a recovery post fails and the condition is reopened, the next false sample sends the recovery again without a new hold.
 
 Kinds are `down`, `bad_status_page`, `dropped`, `active`, `waiting`, `reading`, `writing`, `stall`, `probe`, `config_test`, `restart`, and `lag`. Use a stable target label derived from the URL, not from response data. `lag` uses the fixed target `nginx-monitor`.
 
@@ -173,7 +175,9 @@ Cover at least:
 - Slack retry: one failed post defers the rest of the cycle, a failed restart is retried with its original time, a second restart does not replace a queued one, the restart queue is capped, and a queued incident is sent before its recovery.
 - Authorization: loopback with no token, non-loopback with no token, a matching bearer token, a wrong bearer token, and a token supplied only as a query string.
 - Status history slicing with an optional `limit` query parameter.
-- Graceful shutdown stops the cron timer, waits for a running cycle, then closes the server. A cycle still running at the wait limit does not block the close.
+- Graceful shutdown stops the cron timer, waits for a running cycle, then closes the server. A cycle still running at the wait limit does not block the close. A signal during the first sample does not start the cron timer.
+- Recovery hold: a flapping condition sends one incident and no recovery until `RECOVER_AFTER_SAMPLES` false samples in a row, a true sample restarts the count, and a reopened condition recovers on the next false sample.
+- A counter restart and a pid change in the same cycle post one restart message.
 - Reading and writing thresholds alert the same way as active and waiting, and a threshold of 0 disables them.
 - Stall own-request counts follow the status URL origin, so a fetch to a different origin is not quiet traffic for this URL.
 - A skipped cycle is counted, the next completed cycle alerts `lag` when the count reaches the minimum, and a later cycle with no skips recovers.

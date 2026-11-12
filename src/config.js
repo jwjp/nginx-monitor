@@ -17,6 +17,7 @@ export const DEFAULTS = {
   readingConnectionsThreshold: 0,
   writingConnectionsThreshold: 0,
   skippedCyclesMin: 1,
+  recoverAfterSamples: 3,
   probeTimeoutMs: 5000,
   allowRemoteProbe: false,
   probeAcceptedStatuses: '200-399',
@@ -65,6 +66,11 @@ function readNumber(env, name, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return number;
+}
+
+function readCount(env, name, fallback) {
+  const value = readNumber(env, name, fallback);
+  return Number.isInteger(value) && value >= 1 ? value : fallback;
 }
 
 function readPort(env, fallback) {
@@ -237,6 +243,7 @@ export function loadConfig(env) {
     readingConnectionsThreshold: readNumber(env, 'READING_CONNECTIONS_THRESHOLD', DEFAULTS.readingConnectionsThreshold),
     writingConnectionsThreshold: readNumber(env, 'WRITING_CONNECTIONS_THRESHOLD', DEFAULTS.writingConnectionsThreshold),
     skippedCyclesMin: readNumber(env, 'SKIPPED_CYCLES_MIN', DEFAULTS.skippedCyclesMin),
+    recoverAfterSamples: readCount(env, 'RECOVER_AFTER_SAMPLES', DEFAULTS.recoverAfterSamples),
     ownRequestsByUrl,
     probeUrl,
     probeTimeoutMs: readTimeout(env, 'PROBE_TIMEOUT_MS', DEFAULTS.probeTimeoutMs),

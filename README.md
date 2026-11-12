@@ -37,7 +37,9 @@ On each scheduled cycle the runtime:
 - Counts a skip when a new cycle is due while the previous one is still running. The next cycle that finishes alerts `lag` once the skipped count reaches `SKIPPED_CYCLES_MIN`. The default is 1, and `0` turns it off. The skipped cycle does not itself call Slack.
 - Appends the sample to a local history file and serves that file on loopback. Each snapshot also records how many cycles were skipped, how many Slack messages are still queued, and which conditions are open.
 
-A condition that remains true is throttled. A recovery clears that throttle, so the next incident alerts immediately. A restart is an event, not a condition, so every restart alerts.
+A condition that remains true is throttled. A recovery clears that throttle, so the next incident alerts immediately. A restart is an event, not a condition, so every restart alerts. When the pid check is on, the pid change is added to the counter restart message instead of posting a second one.
+
+A status condition or the probe recovers only after `RECOVER_AFTER_SAMPLES` good samples in a row, 3 by default. A value that flaps around a threshold therefore posts one alert, repeats only on the throttle, and posts one recovery once it has settled. Set it to `1` to recover on the first good sample. `nginx -t`, the pid-file alert, and `lag` always recover on the first good sample.
 
 If Slack rejects or times out an incident post, the alert is kept in memory and retried on the next cycle, with its original time and a `delivered late at` line. If the condition is still true on that cycle, the new alert replaces the queued one and carries the new time. Restarts are never merged, and up to 10 per target wait for delivery. After one failed post, the rest of that cycle's posts wait too, so an unreachable Slack does not slow the sampling. A failed recovery post is not queued: the next good cycle sends a fresh recovery, and if the condition returns first, the new incident alerts without waiting for the throttle. The queue does not survive a process restart.
 
@@ -139,6 +141,7 @@ CRON_TIMEZONE=America/New_York
 | `NGINX_BIN` | `nginx` | NGINX executable used for `nginx -t`. |
 | `NGINX_PID_FILE` | empty | Master pid file, often `/run/nginx.pid`. |
 | `THROTTLE_DURATION_MS` | `900000` | Minimum interval for a repeated alert of the same condition. |
+| `RECOVER_AFTER_SAMPLES` | `3` | Consecutive good samples before a status or probe condition recovers. A whole number of at least 1. |
 | `SLACK_TIMEOUT_MS` | `10000` | Slack request timeout. Same limits as the status timeout. |
 | `RUN_ONCE` | `false` | Run one cycle and exit. |
 | `WEB_ENABLED` | `true` | Enable the status HTTP endpoint. |

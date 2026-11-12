@@ -148,6 +148,8 @@ async function withStatus(options, run) {
     STATUS_URL: statusUrl,
     STATUS_LOG_FILE: historyFile,
     WEB_ENABLED: 'false',
+    RECOVER_AFTER_SAMPLES: String(options.recoverAfter ?? 1),
+    ACTIVE_CONNECTIONS_THRESHOLD: String(options.activeThreshold ?? 0),
   };
   if (options.pid) env.NGINX_PID_FILE = pidFile;
   let now = Date.parse('2026-11-12T00:00:00.000Z');
@@ -408,4 +410,44 @@ test('one failed post defers the rest of the cycle instead of retrying each one'
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('a gauge that flaps around its threshold posts once, then one recovery', async () => {
+  await withStatus({ recoverAfter: 3, activeThreshold: 10 }, async ({ ctx, slack, setBody, advance }) => {
+    let accepts = 10;
+    const sampleWith = (active) => {
+      accepts += 1;
+      setBody(page(active, accepts, accepts, accepts));
+    };
+    for (const active of [12, 5, 12, 5, 12, 5]) {
+      sampleWith(active);
+      await runCycle(ctx);
+      advance();
+    }
+    assert.equal(slack.length, 1);
+    assert.match(slack[0], / active\n/);
+
+    for (let i = 0; i < 3; i += 1) {
+      sampleWith(5);
+      await runCycle(ctx);
+      advance();
+    }
+    assert.equal(slack.length, 2);
+    assert.match(slack[1], /active recovered/);
+  });
+});
+
+test('a restart that also changes the master pid posts once', async () => {
+  await withStatus({ pid: true }, async ({ ctx, slack, pidFile, setBody, advance }) => {
+    setBody(page(1, 100, 100, 100));
+    await runCycle(ctx);
+
+    setBody(page(1, 1, 1, 1));
+    await writeFile(pidFile, '43\n');
+    advance();
+    await runCycle(ctx);
+    assert.equal(slack.length, 1);
+    assert.match(slack[0], / restart\n/);
+    assert.match(slack[0], /counters moved backward; master pid changed from 42 to 43/);
+  });
 });
