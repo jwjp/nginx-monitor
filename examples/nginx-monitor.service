@@ -1,0 +1,15 @@
+[Unit]
+Description=NGINX stub_status watchdog
+After=network-online.target
+
+[Service]
+Type=simple
+User=nginx-monitor
+WorkingDirectory=/opt/nginx-monitor
+EnvironmentFile=/opt/nginx-monitor/.env
+ExecStart=/usr/bin/node /opt/nginx-monitor/nginx-monitor.js
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

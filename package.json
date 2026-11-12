@@ -1,0 +1,20 @@
+{
+  "name": "nginx-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Slack watchdog for open-source NGINX stub_status.",
+  "license": "Unlicense",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node nginx-monitor.js",
+    "test": "node --test",
+    "check": "node --check nginx-monitor.js && node --check src/config.js && node --check src/stub-status.js && node --check src/decide.js && node --check src/probe.js && node --check src/nginx-cmd.js && node --check src/slack.js && node --check src/history.js && node --check src/status-server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "node-cron": "^4.2.1"
+  }
+}

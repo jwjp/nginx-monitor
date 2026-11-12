@@ -8,7 +8,7 @@ English is the default. [한국어 안내](README.ko.md)
 
 ## Status
 
-This repository fixes the behavior contract and the agent rules. The Node.js runtime is not implemented yet. Implementation follows [AGENTS.md](AGENTS.md). [AGENTS.ko.md](AGENTS.ko.md) is the Korean review copy. The English agent file wins if the two differ.
+The Node.js runtime implements the behavior contract in [AGENTS.md](AGENTS.md). [AGENTS.ko.md](AGENTS.ko.md) is the Korean review copy. The English agent file wins if the two differ.
 
 ## Why this shape
 
@@ -24,25 +24,27 @@ pm2-monitor runs under PM2 because the host already uses PM2. An NGINX host ofte
 
 pm2-monitor's default schedule is weekday business hours in `America/New_York`. That is an operator preference. nginx-monitor defaults to every minute, all day, in UTC, because a web server should still be watched at night.
 
-## What the runtime will watch
+## What each cycle watches
 
-On each scheduled cycle the runtime will:
+On each scheduled cycle the runtime:
 
-- Fetch `stub_status`. A failed fetch, a timeout, or a body that is not `stub_status` raises a down alert. The next good sample raises a recovery alert.
-- Compare counters with the previous good sample. Counters that move backward mean NGINX restarted. That sample becomes the new baseline, and the cycle reports the restart.
-- Alert when accepted connections in the interval exceed handled connections by `DROPPED_CONNECTIONS_MIN`.
-- Alert when active connections or waiting connections cross an operator threshold. Both default to off. The useful number depends on `worker_processes` and `worker_connections`.
-- Optionally request one probe URL and alert when the status is outside the accepted set.
-- Optionally run `nginx -t` and read the master pid file. Both stay off unless configured, so the process can run without root.
-- Append the sample to a local history file and serve that file on loopback.
+- Fetches `stub_status`. A failed fetch, a redirect, a non-200 response, a timeout, or an oversized body raises a down alert. A 200 body that is not `stub_status` raises a bad-page alert. The next good sample raises a recovery alert for that condition.
+- Compares counters with the previous good sample. Counters that move backward mean NGINX restarted. That sample becomes the new baseline, and the cycle reports the restart.
+- Alerts when accepted connections in the interval exceed handled connections by `DROPPED_CONNECTIONS_MIN`.
+- Alerts when active connections or waiting connections cross an operator threshold. Both default to off. The useful number depends on `worker_processes` and `worker_connections`.
+- Optionally requests one probe URL and alerts on a redirect, a transport error, or a status outside the accepted set. A redirect fails even when its status is inside the default `200-399`.
+- Optionally runs `nginx -t` and reads the master pid file. Both stay off unless configured, so the process can run without root.
+- Appends the sample to a local history file and serves that file on loopback.
 
-A condition that remains true is throttled. A recovery clears that throttle, so the next incident alerts immediately.
+A condition that remains true is throttled. A recovery clears that throttle, so the next incident alerts immediately. A restart is an event, not a condition, so every restart alerts.
+
+If Slack rejects or times out an incident post, the alert is kept in memory and retried on the next cycle, with its original time and a `delivered late at` line. If the condition is still true on that cycle, the new alert replaces the queued one and carries the new time. Restarts are never merged, and up to 10 per target wait for delivery. After one failed post, the rest of that cycle's posts wait too, so an unreachable Slack does not slow the sampling. A failed recovery post is not queued: the next good cycle sends a fresh recovery, and if the condition returns first, the new incident alerts without waiting for the throttle. The queue does not survive a process restart.
 
 A completed cycle exits successfully even when NGINX is down. The down state is a Slack alert. The process stays up so systemd does not restart-loop on the condition it is reporting. `RUN_ONCE=true` is the one-shot form for a smoke test.
 
 ## Requirements
 
-- Node.js 22 or later, once the runtime lands
+- Node.js 22 or later
 - Open-source NGINX built with `http_stub_status_module` (current distribution packages include it)
 - A `stub_status` location that accepts localhost only
 - A Slack Incoming Webhook URL
@@ -115,27 +117,27 @@ CRON_TIMEZONE=America/New_York
 | `STATUS_URL` | `http://127.0.0.1/nginx_status` | `stub_status` URL. |
 | `STATUS_URLS` | empty | Extra comma-separated `stub_status` URLs. |
 | `ALLOW_REMOTE_STATUS` | `false` | Allow a status URL that is not loopback. |
-| `STATUS_TIMEOUT_MS` | `5000` | Status fetch timeout. |
-| `CRON_SCHEDULE` | `* * * * *` | Monitor schedule in node-cron syntax. |
-| `CRON_TIMEZONE` | `UTC` | Time zone used for the schedule and timestamps. |
+| `STATUS_TIMEOUT_MS` | `5000` | Status fetch timeout. `0` or a value above 2147483647 uses the default. |
+| `CRON_SCHEDULE` | `* * * * *` | Five-field node-cron schedule. A seconds field is rejected. |
+| `CRON_TIMEZONE` | `UTC` | Time zone for the schedule. Alert timestamps are UTC. |
 | `ACTIVE_CONNECTIONS_THRESHOLD` | `0` | Active-connection alert. `0` disables it. |
 | `WAITING_CONNECTIONS_THRESHOLD` | `0` | Waiting-connection alert. `0` disables it. |
 | `DROPPED_CONNECTIONS_MIN` | `1` | Minimum dropped connections in one interval. `0` disables it. |
-| `REQUEST_STALL_ENABLED` | `false` | Alert when the request counter stops moving. |
-| `REQUEST_STALL_WINDOWS` | `5` | Consecutive quiet samples required for a stall alert. |
+| `REQUEST_STALL_ENABLED` | `false` | Alert when only the monitor's own requests move the request counter. |
+| `REQUEST_STALL_WINDOWS` | `5` | Consecutive quiet good samples required for a stall alert. |
 | `PROBE_URL` | empty | Optional URL requested through NGINX. |
-| `PROBE_TIMEOUT_MS` | `5000` | Probe timeout. |
+| `PROBE_TIMEOUT_MS` | `5000` | Probe timeout. Same limits as the status timeout. |
 | `ALLOW_REMOTE_PROBE` | `false` | Allow a probe URL that is not loopback. |
 | `PROBE_ACCEPTED_STATUSES` | `200-399` | Accepted probe statuses, as a list or an inclusive range. |
 | `NGINX_TEST_ENABLED` | `false` | Run `nginx -t` on each cycle. |
 | `NGINX_BIN` | `nginx` | NGINX executable used for `nginx -t`. |
 | `NGINX_PID_FILE` | empty | Master pid file, often `/run/nginx.pid`. |
 | `THROTTLE_DURATION_MS` | `900000` | Minimum interval for a repeated alert of the same condition. |
-| `SLACK_TIMEOUT_MS` | `10000` | Slack request timeout. |
+| `SLACK_TIMEOUT_MS` | `10000` | Slack request timeout. Same limits as the status timeout. |
 | `RUN_ONCE` | `false` | Run one cycle and exit. |
 | `WEB_ENABLED` | `true` | Enable the status HTTP endpoint. |
 | `HOST` | `127.0.0.1` | Bind address for the status endpoint. |
-| `PORT` | `3032` | Port for the status endpoint. |
+| `PORT` | `3032` | Port for the status endpoint. Must be an integer up to 65535. |
 | `STATUS_LOG_FILE` | `./status-history.json` | Runtime status history file. |
 | `MAX_HISTORY` | `1440` | Status snapshots to retain. |
 | `STATUS_TOKEN` | empty | Bearer token for `/status`. Required when `HOST` is not loopback. |
@@ -159,19 +161,26 @@ curl -H "Authorization: Bearer $STATUS_TOKEN" http://127.0.0.1:3032/status
 
 The token is accepted only in the `Authorization` header.
 
-## Run shape
+## Examples
 
-The intended commands, once the runtime exists:
+Operator configuration lives in `examples/`. The program does not install these files.
+
+- `examples/nginx-stub-status.conf` is the localhost `stub_status` location.
+- `examples/nginx-monitor.service` is the systemd unit.
+- `examples/ecosystem.config.cjs` is the optional PM2 process, named `nginx-monitor`.
+
+## Run
 
 ```bash
 npm install
 npm test
+npm run check
 npm start
 ```
 
-`npm start` runs `node nginx-monitor.js`. It does not require PM2.
+`npm start` runs `node nginx-monitor.js`. It does not require PM2. `npm test` uses `node --test` and does not call Slack or NGINX.
 
-systemd is the supervisor to ship an example for. Use `Restart=on-failure`, an unprivileged user, and `NoNewPrivileges=true`. A down NGINX must not be a failing process exit.
+systemd is the documented supervisor. The example unit uses `Restart=on-failure`, an unprivileged user, and `NoNewPrivileges=true`. A down NGINX must not be a failing process exit.
 
 On a host that already uses PM2, an optional ecosystem file may supervise the same Node process under the name `nginx-monitor`.
 
@@ -180,7 +189,7 @@ On a host that already uses PM2, an optional ecosystem file may supervise the sa
 - Keep the Slack webhook out of git, logs, and Slack message text.
 - Serve `stub_status` on localhost only. The monitor refuses a non-loopback status or probe URL unless the matching allow flag is set.
 - Status fetches and probes do not follow redirects.
-- The history file stores counts and booleans. It does not store request URIs, client addresses, command output, or the webhook.
+- The history file stores counts, deltas, probe status codes, check booleans, and the master pid when known. It does not store request URIs, client addresses, command output, or the webhook.
 - The monitor never reloads or restarts NGINX.
 - Run the process as an unprivileged user that can read the status page.
 
