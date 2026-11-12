@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+status-history.json
+status-history.json.*.tmp
+*.log
+logs/
+.DS_Store

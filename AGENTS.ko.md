@@ -1,0 +1,185 @@
+# AGENTS.md 한국어 검토본
+
+이 저장소에서 작업하는 코딩 에이전트를 위한 지침입니다. 사람도 읽을 수 있습니다.
+
+기준 문서는 영어 [AGENTS.md](AGENTS.md)입니다. 두 파일이 다르면 영어 파일이 우선합니다. 바꿀 때는 같은 커밋에서 둘 다 고칩니다.
+
+코드, 커밋, 이슈, 풀 리퀘스트, 그리고 기준 문서의 언어는 영어입니다. 한국어 사본은 메인테이너가 검토하려고 둔 것입니다.
+
+사람을 위한 동작 계약은 [README.md](README.md)와 [README.ko.md](README.ko.md)입니다. README 두 개와 `.env.example`을 이 파일과 맞춥니다.
+
+## 프로젝트
+
+nginx-monitor는 오픈소스 NGINX 호스트 하나, 또는 그 호스트의 로컬 `stub_status` URL 몇 개를 위한 작은 Slack 워치독입니다. [pm2-monitor](https://github.com/jwjp/pm2-monitor)의 NGINX 짝입니다.
+
+pm2-monitor가 성립하는 이유는 `pm2 jlist`가 로컬의 구조화된 상태 API이기 때문입니다. 여기에 해당하는 NGINX API는 루프백의 `stub_status` 텍스트 페이지입니다. 그 페이지를 cron으로 읽고, 이전 샘플과 비교하고, 반복을 줄인 Slack 메시지를 보냅니다.
+
+배포 경로는 이 git 저장소입니다. 메인테이너가 요청하기 전에는 npm에 패키지를 올리지 않습니다.
+
+## 만들지 말 것
+
+아래는 검토한 뒤 제외한 범위입니다. 메인테이너가 요청하기 전에는 다시 열지 않습니다.
+
+- Prometheus exporter, 시계열 데이터베이스, Grafana 대시보드, Alertmanager 규칙. Prometheus를 이미 쓰는 운영자에게는 nginx-prometheus-exporter를 안내합니다.
+- 액세스 로그 또는 에러 로그 tail. 로그에는 요청 URI와 클라이언트 주소가 있습니다. 파서, 수집기, 원문 로그를 Slack으로 보내는 옵션을 넣지 않습니다.
+- NGINX Plus 상태 API, `ngx_http_api_module`, 상용 전용 지표.
+- PM2 필수 의존. `npm start`는 `node nginx-monitor.js`를 실행합니다. 문서화하는 감독 프로세스는 systemd입니다. PM2 ecosystem 파일은 선택적 예시로만 둘 수 있습니다.
+- 자동 `reload`, `restart`, `nginx -s ...`, 서비스 매니저 복구. 프로세스는 알리기만 합니다. NGINX를 제어하지 않습니다.
+- 웹 대시보드, 사용자 계정, 플러그인 시스템.
+- pm2-monitor의 기본 스케줄인 `America/New_York` 평일 업무 시간. 여기의 기본값은 `UTC`의 `* * * * *`입니다.
+- Windows 서비스 지원. HTTP 확인은 Node가 도는 곳에서 실행할 수 있습니다. 지원 운영 체제는 Linux로 문서화합니다. Windows 서비스 래퍼는 만들지 않습니다.
+- pm2-monitor의 axios를 가져오는 것. Node 22의 전역 `fetch`를 씁니다.
+
+## 런타임 배치
+
+구현은 이 배치 안에 둡니다. 그 바깥에 프레임워크를 두르지 않습니다.
+
+```text
+nginx-monitor.js          # 진입점. 설정을 읽고 타이머를 켜고 한 사이클을 실행합니다.
+src/config.js             # 환경 변수 파싱과 검증
+src/stub-status.js        # 가져오기, 파싱, 카운터 차이
+src/decide.js             # 순수 함수로 된 알림 판단
+src/probe.js              # 선택적 HTTP 프로브
+src/nginx-cmd.js          # 선택적 nginx -t와 pid 파일 읽기
+src/slack.js              # 웹훅 페이로드와 반복 억제
+src/history.js            # 상태 스냅샷 파일
+src/status-server.js      # GET /healthz 와 GET /status
+test/*.test.js            # node:test. 실제 NGINX와 실제 Slack은 쓰지 않습니다.
+examples/nginx-stub-status.conf
+examples/nginx-monitor.service
+examples/ecosystem.config.cjs
+```
+
+`package.json`은 애플리케이션 매니페스트입니다. `"private": true`, `"type": "module"`, `"engines.node": ">=22"`. 의존성은 `dotenv`와 `node-cron`만 둡니다. Node 22만으로 되는 일에 의존성을 더하지 않습니다. `npm start`는 `node nginx-monitor.js`입니다. `npm test`는 `node --test`입니다. 진입 파일과 `src`의 문법을 검사하는 `check` 스크립트를 둡니다. `package.json`과 GitHub Actions가 생기면 npm과 GitHub Actions용 Dependabot을 추가합니다.
+
+알림 판단, `stub_status` 파싱, URL 검사, 반복 억제 전이, 토큰 비교는 단위 테스트가 있는 순수 함수입니다. 네트워크, 프로세스, 파일 시스템 호출은 얇은 래퍼에 둡니다.
+
+## 사이클
+
+1. 설정을 검증합니다. 실패하면 짧은 로그를 남기고 1로 종료합니다. 타이머를 시작하지 않습니다.
+2. `RUN_ONCE`가 아니고 `WEB_ENABLED`가 참이면 상태 서버를 시작합니다.
+3. 샘플을 즉시 한 번 받은 다음 사이클을 예약합니다.
+4. 한 사이클은 모든 상태 URL을 가져오고, 차이를 계산하고, 필요하면 프로브와 `nginx -t`와 pid 파일을 확인하고, 알림을 결정하고, Slack을 보내고, 이력 스냅샷을 하나 추가합니다.
+5. 사이클이 끝나면 NGINX가 다운이어도 성공입니다. 1로 끝나는 경우는 잘못된 설정, 잡히지 않은 예외, 예외를 던진 `RUN_ONCE` 사이클뿐입니다. 알림을 보냈더라도 사이클이 끝나면 `RUN_ONCE`는 0으로 끝납니다.
+6. 스케줄, 시간대, 상태 URL, 켜진 선택 검사를 로그로 남깁니다. 웹훅, 상태 토큰, URL의 userinfo는 로그에 남기지 않습니다.
+
+## stub_status
+
+`GET`, `redirect: "manual"`, `STATUS_TIMEOUT_MS` 시간 제한, 본문 상한 64 KiB로 가져옵니다. 리다이렉트, 200이 아닌 응답, 시간 초과, 네트워크 오류, 너무 큰 본문은 `down`입니다.
+
+공식 본문은 다음과 같습니다.
+
+```text
+Active connections: 291
+server accepts handled requests
+ 16630948 16630948 31070465
+Reading: 6 Writing: 179 Waiting: 106
+```
+
+파싱하는 사실은 이 세 가지뿐입니다.
+
+- `Active connections: <정수>`
+- `server accepts handled requests` 헤더 다음, 정수 세 개로 된 첫 줄. 순서는 accepts, handled, requests입니다.
+- `Reading: <정수> Writing: <정수> Waiting: <정수>`
+
+공백이 더 있어도 받습니다. 그 외의 본문은 `bad_status_page`입니다. 이 알림은 `down`과 다릅니다.
+
+한 URL의 첫 정상 샘플은 기준점입니다. 버려진 연결 알림과 정체 알림을 만들지 않습니다. 이후 샘플은 이전 정상 샘플과의 정수 차이, 그리고 흐른 초를 사용합니다.
+
+누적 카운터 중 하나라도 뒤로 가거나, 새 accepts가 이전 값보다 작으면 NGINX가 재시작되었거나 카운터가 초기화된 것입니다. `restart`를 내고, 새 샘플을 기준점으로 저장하고, 그 점프를 버려진 연결로 계산하지 않습니다.
+
+`dropped = delta(accepts) - delta(handled)`입니다. 최소값이 0보다 크고 `dropped >= DROPPED_CONNECTIONS_MIN`이면 `dropped`를 알립니다.
+
+임계값이 0보다 크고 `active >= threshold`이면 `active`를 알립니다. `waiting`도 같은 방식입니다. reading과 writing은 이력에 저장하고 v1의 알림 조건으로는 쓰지 않습니다.
+
+`REQUEST_STALL_ENABLED`의 기본값은 거짓입니다. 참일 때는 요청 차이가 0인 정상 샘플이 `REQUEST_STALL_WINDOWS`번 연속된 뒤에만 알립니다. 그리고 이 프로세스가 요청 차이가 양수인 샘플을 이미 본 뒤여야 합니다. 조용한 사이트가 시작 직후 알림을 받으면 안 됩니다.
+
+상태 URL은 각각 따로 추적합니다. `STATUS_URL`은 필수입니다. `STATUS_URLS`는 URL을 더합니다. URL 기준으로 중복을 제거합니다. 실용적인 상한은 8개입니다. 그보다 많으면 검증에 실패합니다.
+
+## 프로브, 설정 검사, pid
+
+`PROBE_URL`이 비어 있으면 프로브는 꺼져 있습니다. 설정되면 `redirect: "manual"`과 프로브 시간 제한으로 `GET`하고, 응답 본문은 저장하지 않습니다. 리다이렉트나 전송 오류는 프로브 실패입니다. 상태는 `PROBE_ACCEPTED_STATUSES`와 비교합니다. 값 하나는 단일 코드, 쉼표 목록, 또는 `200-399` 같은 양 끝 포함 범위입니다. Slack 문구에는 상태 코드와 userinfo를 뺀 URL을 넣습니다. 본문은 넣지 않습니다.
+
+`NGINX_TEST_ENABLED`의 기본값은 거짓입니다. 참이면 인자 배열과 시간 제한으로 `execFile(NGINX_BIN, ["-t"])`를 실행합니다. 셸 문자열은 쓰지 않습니다. 성공은 종료 코드 0입니다. `nginx -t`는 성공해도 stderr에 "syntax is ok"를 씁니다. 성공 시의 stderr는 무시합니다. 실패하면 Slack 메시지에 stderr를 300자까지 넣을 수 있습니다. 이력 파일에는 `ok: false`만 저장합니다.
+
+`NGINX_PID_FILE`이 비어 있으면 pid 검사는 꺼져 있습니다. 설정되면 파일을 읽고 정수 하나만 받습니다. 이전 pid와 달라지면 `restart`를 냅니다. 파일이 없거나 형식이 잘못되면 설정 알림을 한 번 냅니다. 프로세스에 시그널을 보내지 않습니다.
+
+## URL 가드
+
+가져오기 전에 모든 상태 URL과 모든 프로브 URL에 이 검사를 적용합니다.
+
+- 프로토콜은 `http:` 또는 `https:`입니다.
+- URL에 사용자 이름이나 비밀번호가 없습니다.
+- 호스트는 `localhost`, `127.0.0.1`, `::1`입니다. 대괄호로 감싼 IPv6를 포함합니다.
+- 그 외 호스트는 해당 종류의 `ALLOW_REMOTE_STATUS` 또는 `ALLOW_REMOTE_PROBE`가 참일 때만 허용합니다.
+- 허용 플래그는 리다이렉트와 userinfo를 허용하지 않습니다.
+
+설정이 잘못되면 첫 요청 전에 1로 종료합니다.
+
+## Slack
+
+호스트가 `hooks.slack.com`이고 경로가 `/services/`로 시작하는 `https` URL만 받습니다.
+
+알림 사건마다 메시지를 하나 보냅니다. 헤더는 `[nginx]`로 시작하고, 대상 라벨, UTC 시각, 이유를 넣습니다. 웹훅 URL은 넣지 않습니다.
+
+반복 억제 키는 `${target}::${kind}`입니다. 조건이 계속 참이면, 같은 키를 `THROTTLE_DURATION_MS` 안에 이미 보냈을 때 전송을 건너뜁니다. 그 대상과 종류의 복구는 키를 지웁니다. 그래서 다음 사건은 바로 전송됩니다. 복구 메시지가 억제로 사라지면 안 됩니다.
+
+종류는 `down`, `bad_status_page`, `dropped`, `active`, `waiting`, `stall`, `probe`, `config_test`, `restart`입니다. 대상 라벨은 응답 내용이 아니라 URL에서 안정적으로 만듭니다.
+
+Slack 전송 실패는 로그로 남기고 사이클을 중단하지 않습니다. 이력 스냅샷은 그 샘플을 그대로 기록합니다.
+
+## 상태 서버
+
+pm2-monitor의 인가 동작을 따릅니다. 여기서 다시 구현합니다. pm2-monitor를 의존성으로 가져오지 않습니다.
+
+- `HOST`와 `PORT`에 바인드합니다. 기본값은 `127.0.0.1`과 `3032`입니다.
+- `GET /healthz`는 NGINX 데이터 없이, 토큰 검사 없이 `{ "ok": true }`를 반환합니다.
+- `GET /status`는 이력 JSON을 반환합니다.
+- `STATUS_TOKEN`이 비어 있으면, `HOST`가 `127.0.0.1`, `::1`, `localhost`일 때만 `/status`를 허용합니다. 다른 호스트에서 토큰이 비어 있으면 `/status`는 401입니다.
+- 토큰이 설정되면 `Authorization: Bearer <token>`으로만 비교합니다. 헤더 값과 기대값을 모두 SHA-256으로 해시한 뒤 `timingSafeEqual`로 다이제스트를 비교합니다. 쿼리 문자열, 쿠키, 사용자 정의 헤더의 토큰은 받지 않습니다.
+- 그 외 메서드와 경로는 404입니다.
+- 응답에는 `Cache-Control: no-store`를 넣습니다.
+- 이력은 같은 디렉터리의 임시 파일에 쓴 다음 `STATUS_LOG_FILE` 위로 rename합니다. 스냅샷은 최신순으로 최대 `MAX_HISTORY`개입니다.
+- 이력 스냅샷에는 시각, URL별 개수, 차이, 프로브 결과의 불리언과 상태 코드, 설정 검사와 pid 검사의 불리언, 알고 있는 경우 마스터 pid가 들어갑니다. 웹훅, 토큰, 응답 본문, stderr, 요청 URI, 클라이언트 주소는 들어가지 않습니다.
+
+## 설정 파싱
+
+이미 설정된 변수는 덮어쓰지 않고 `dotenv`로 `.env`를 읽습니다.
+
+- 문자열은 trim합니다. 빈 문자열은 기본값을 씁니다.
+- 목록은 쉼표로 나누고, trim하고, 빈 항목을 버립니다.
+- 불리언은 대소문자 구분 없이 `1`, `true`, `yes`, `on`을 참으로 받습니다. 환경에 다른 값이 있으면 거짓입니다. 변수가 없으면 기본값을 씁니다.
+- 숫자는 유한수이고 0 이상이어야 합니다. 그 외에는 기본값을 씁니다. 필수 URL은 예외입니다.
+- 시작 전에 `cron.validate`로 cron 식을 검증합니다.
+
+기본값은 [.env.example](.env.example)과 README 표의 값입니다. 두 번째 기본값 집합을 만들지 않습니다.
+
+## 테스트
+
+`node:test`와 `node:assert/strict`를 씁니다. 테스트 러너 의존성은 두지 않습니다. 테스트가 임시 포트로 `127.0.0.1`에 바인드하는 경우를 제외하면, NGINX, Slack, 네트워크 리스너 없이 통과해야 합니다.
+
+최소한 다음을 다룹니다.
+
+- 공식 `stub_status` 샘플, 추가 공백, HTML 본문이 잘못된 페이지로 거절되는지.
+- 조용한 구간, 연결이 버려진 구간, 카운터 초기화의 차이 계산.
+- 루프백 URL 허용, 공개 호스트 거절, userinfo 거절, 해당 허용 플래그가 있을 때만 공개 호스트 허용.
+- `200-399`와 쉼표 목록의 프로브 상태 일치.
+- 반복 억제. 구간 안의 반복은 건너뛰고, 복구는 키를 지우고, 다음 사건은 전송합니다.
+- 인가. 토큰 없는 루프백, 토큰 없는 비루프백, 일치하는 Bearer 토큰, 틀린 Bearer 토큰, 쿼리 문자열로만 준 토큰.
+- 정체 감지는 첫 바쁜 샘플 전과 기능이 꺼져 있을 때 조용한지.
+
+`hooks.slack.com`을 호출하는 테스트는 넣지 않습니다.
+
+## 문서
+
+동작이 바뀌어 계약이 달라지면 같은 변경에서 `README.md`, `README.ko.md`, `AGENTS.md`, `AGENTS.ko.md`, `.env.example`을 함께 고칩니다. 코드 주석은 코드만으로 보이지 않는 제약만 설명합니다. README를 주석으로 반복하지 않습니다.
+
+`examples/` 아래 예시는 운영자가 복사하는 설정입니다. 프로그램이 설치하지 않습니다.
+
+systemd 예시는 `Restart=on-failure`, 권한 없는 `User=`, `NoNewPrivileges=true`를 씁니다. PM2 예시는 선택 사항이고 프로세스 이름은 `nginx-monitor`입니다.
+
+## 커밋과 풀 리퀘스트
+
+커밋 제목은 영어로, 명령형으로 쓰고, 이유를 담은 짧은 본문을 붙입니다. 커밋은 한 가지에 집중합니다.
+
+`.env`, `status-history.json`, `node_modules`, 실제 웹훅은 커밋하지 않습니다. 데모를 쉽게 하려고 URL 가드, 토큰 비교, 리다이렉트 규칙을 느슨하게 만들지 않습니다.
