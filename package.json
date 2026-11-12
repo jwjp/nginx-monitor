@@ -14,7 +14,7 @@
     "check": "node -e \"const fs = require('node:fs'); const { execFileSync } = require('node:child_process'); for (const file of ['nginx-monitor.js', ...fs.readdirSync('src').filter((name) => name.endsWith('.js')).map((name) => 'src/' + name)]) execFileSync(process.execPath, ['--check', file], { stdio: 'inherit' })\""
   },
   "dependencies": {
-    "dotenv": "^17.4.2",
+    "dotenv": "^18.0.10",
     "node-cron": "^4.2.1"
   }
 }
