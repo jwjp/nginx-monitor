@@ -224,9 +224,52 @@ async function listenStatusServer(config) {
   if (!config.statusToken && !isLoopbackHost(config.host)) {
     console.warn(`HOST=${config.host} is not loopback. /status stays closed until STATUS_TOKEN is set.`);
   }
+  return server;
 }
 
-export async function start(env = process.env) {
+export async function stop({ server, task, ctx, timeoutMs = 5000 } = {}) {
+  if (task && typeof task.stop === 'function') {
+    task.stop();
+  }
+  if (server && typeof server.close === 'function') {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
+  if (ctx && ctx.running) {
+    const startWait = Date.now();
+    while (ctx.running && Date.now() - startWait < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
+export function registerSignalHandlers(state, {
+  processObj = process,
+  onExit = () => processObj.exit(0),
+} = {}) {
+  let shuttingDown = false;
+  const handler = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`received ${signal}, shutting down`);
+    try {
+      await stop(state);
+    } catch (error) {
+      console.error(`shutdown error: ${error.message}`);
+    }
+    onExit();
+  };
+  const onSigint = () => handler('SIGINT');
+  const onSigterm = () => handler('SIGTERM');
+  processObj.on('SIGINT', onSigint);
+  processObj.on('SIGTERM', onSigterm);
+  return () => {
+    processObj.off('SIGINT', onSigint);
+    processObj.off('SIGTERM', onSigterm);
+  };
+}
+
+export async function start(env = process.env, signalOptions = {}) {
   let config;
   try {
     config = loadConfig(env);
@@ -236,8 +279,9 @@ export async function start(env = process.env) {
   }
 
   logStartup(config);
+  let server = null;
   if (!config.runOnce && config.webEnabled) {
-    await listenStatusServer(config);
+    server = await listenStatusServer(config);
   }
 
   const ctx = createContext(config);
@@ -249,7 +293,7 @@ export async function start(env = process.env) {
   }
   if (config.runOnce) process.exit(0);
 
-  cron.schedule(config.cronSchedule, () => {
+  const task = cron.schedule(config.cronSchedule, () => {
     runCycle(ctx).catch((error) => {
       console.error(`cycle failed: ${error.message}`);
     });
@@ -257,6 +301,9 @@ export async function start(env = process.env) {
     timezone: config.cronTimezone,
     noOverlap: true,
   });
+
+  const unregister = registerSignalHandlers({ server, task, ctx }, signalOptions);
+  return { server, task, ctx, unregister };
 }
 
 function invokedDirectly() {

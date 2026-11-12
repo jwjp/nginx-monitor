@@ -6,6 +6,13 @@ function sha256(value) {
   return createHash('sha256').update(value).digest();
 }
 
+export function parseLimit(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  if (!Number.isInteger(num) || num <= 0) return null;
+  return num;
+}
+
 export function authorizeStatus({ host, token, authorization }) {
   if (!token) return isLoopbackHost(host);
   // Hash both sides so timingSafeEqual always sees equal-length digests.
@@ -59,7 +66,10 @@ export function createStatusServer({ host, token, readHistory }) {
     }
 
     try {
-      sendJson(res, 200, await readHistory());
+      const history = await readHistory();
+      const limit = parseLimit(url.searchParams.get('limit'));
+      const payload = limit !== null && Array.isArray(history) ? history.slice(0, limit) : history;
+      sendJson(res, 200, payload);
     } catch {
       console.error('status history is unreadable');
       sendJson(res, 500, { error: 'unavailable' });

@@ -40,7 +40,7 @@ A condition that remains true is throttled. A recovery clears that throttle, so 
 
 If Slack rejects or times out an incident post, the alert is kept in memory and retried on the next cycle, with its original time and a `delivered late at` line. If the condition is still true on that cycle, the new alert replaces the queued one and carries the new time. Restarts are never merged, and up to 10 per target wait for delivery. After one failed post, the rest of that cycle's posts wait too, so an unreachable Slack does not slow the sampling. A failed recovery post is not queued: the next good cycle sends a fresh recovery, and if the condition returns first, the new incident alerts without waiting for the throttle. The queue does not survive a process restart.
 
-A completed cycle exits successfully even when NGINX is down. The down state is a Slack alert. The process stays up so systemd does not restart-loop on the condition it is reporting. `RUN_ONCE=true` is the one-shot form for a smoke test.
+A completed cycle exits successfully even when NGINX is down. The down state is a Slack alert. The process stays up so systemd does not restart-loop on the condition it is reporting. `RUN_ONCE=true` is the one-shot form for a smoke test. On `SIGINT` or `SIGTERM`, the process stops the cron schedule, waits for any in-flight cycle to finish, closes the status server, and exits cleanly.
 
 ## Requirements
 
@@ -151,12 +151,13 @@ GET /healthz
 GET /status
 ```
 
-`/healthz` answers `{ "ok": true }` and nothing about NGINX. `/status` returns the history file.
+`/healthz` answers `{ "ok": true }` and nothing about NGINX. `/status` returns the history file. An optional query parameter `limit` (e.g. `GET /status?limit=10`) returns only the newest N snapshots.
 
 The default bind is `127.0.0.1:3032`, one port away from pm2-monitor. On that loopback bind, an empty `STATUS_TOKEN` allows local callers. If `HOST` is anything else, `/status` stays closed until `STATUS_TOKEN` is set.
 
 ```bash
 curl -H "Authorization: Bearer $STATUS_TOKEN" http://127.0.0.1:3032/status
+curl -H "Authorization: Bearer $STATUS_TOKEN" http://127.0.0.1:3032/status?limit=10
 ```
 
 The token is accepted only in the `Authorization` header.

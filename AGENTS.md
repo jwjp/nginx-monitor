@@ -61,7 +61,8 @@ Alert decisions, `stub_status` parsing, URL checks, throttle transitions, and to
 3. Take one sample immediately, then schedule the cycle.
 4. A cycle fetches every status URL, updates deltas, optionally probes, optionally runs `nginx -t`, optionally reads the pid file, decides alerts, sends Slack, and appends one history snapshot.
 5. A finished cycle is success even when NGINX is down. Exit 1 only for invalid configuration, an uncaught exception, or a `RUN_ONCE` cycle that throws. `RUN_ONCE` still exits 0 when the cycle completes and alerts were sent.
-6. Log the schedule, time zone, status URLs, and which optional checks are enabled. Never log the webhook, the status token, or a URL userinfo field.
+6. On `SIGINT` or `SIGTERM`, stop the cron timer, wait for any in-flight cycle to complete, close the status server, and exit 0.
+7. Log the schedule, time zone, status URLs, and which optional checks are enabled. Never log the webhook, the status token, or a URL userinfo field.
 
 ## stub_status
 
@@ -136,7 +137,7 @@ Match the pm2-monitor authorization behavior. Reimplement it here. Do not import
 
 - Bind `HOST` and `PORT`. Default `127.0.0.1` and `3032`.
 - `GET /healthz` returns `{ "ok": true }` with no NGINX data and no token check.
-- `GET /status` returns the history JSON.
+- `GET /status` returns the history JSON. An optional `limit` query parameter (positive integer) returns only the newest `limit` snapshots; an absent, zero, or invalid limit returns the full history.
 - An empty `STATUS_TOKEN` authorizes `/status` only when `HOST` is `127.0.0.1`, `::1`, or `localhost`. Any other host with an empty token answers 401 for `/status`.
 - A configured token is compared as `Authorization: Bearer <token>` only. Hash both the header value and the expected value with SHA-256, then compare the digests with `timingSafeEqual`. Do not accept the token in a query string, a cookie, or a custom header.
 - Other methods and paths answer 404.
@@ -169,6 +170,8 @@ Cover at least:
 - Throttle: a repeat inside the window is skipped, recovery deletes the key, and the next incident sends. A second restart inside the window still sends.
 - Slack retry: one failed post defers the rest of the cycle, a failed restart is retried with its original time, a second restart does not replace a queued one, the restart queue is capped, and a queued incident is sent before its recovery.
 - Authorization: loopback with no token, non-loopback with no token, a matching bearer token, a wrong bearer token, and a token supplied only as a query string.
+- Status history slicing with an optional `limit` query parameter.
+- Graceful shutdown stops the cron timer, closes the server, and waits for a running cycle.
 - Stall detection stays quiet before the first busy sample and when the feature is disabled, treats the monitor's own requests as quiet, and restarts the consecutive count after a `down` sample.
 
 Do not add a test that calls `hooks.slack.com`.
