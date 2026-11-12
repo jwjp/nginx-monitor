@@ -82,7 +82,7 @@ Parse these three facts and nothing else:
 - the first line of three integers after the `server accepts handled requests` header, in the order accepts, handled, requests
 - `Reading: <integer> Writing: <integer> Waiting: <integer>`
 
-Accept extra whitespace. Reject any other body as `bad_status_page`, which is a different alert from `down`.
+Accept extra whitespace: blank lines, leading and trailing spaces, and repeated spaces or tabs inside a line. Reject any other body as `bad_status_page`, which is a different alert from `down`.
 
 The first good sample for a URL is a baseline. It produces no dropped-connection or stall alert. Later samples use integer deltas against the previous good sample and the elapsed seconds.
 
@@ -92,9 +92,9 @@ If any cumulative counter moves backward, or the new accepts value is less than 
 
 Alert `active` when the threshold is greater than 0 and `active >= threshold`. Alert `waiting` the same way. Reading and writing are stored in history and are not alert conditions in v1.
 
-`REQUEST_STALL_ENABLED` defaults to false. When it is true, alert only after `REQUEST_STALL_WINDOWS` consecutive good samples whose request delta is 0, and only after this process has already seen a sample with a positive request delta. A quiet site must not alert at startup.
+`REQUEST_STALL_ENABLED` defaults to false. NGINX counts every request it serves, including the monitor's own `stub_status` fetches and probe, so a request delta of 0 never happens on a polled host. The monitor's own requests per cycle are the number of status URLs plus 1 when `PROBE_URL` is set. A good sample is quiet when its request delta is at most that number times the cycles since the previous good sample. When the feature is true, alert only after `REQUEST_STALL_WINDOWS` consecutive quiet good samples, and only after this process has already seen a busy sample whose request delta is above that number. A `down` or `bad_status_page` sample breaks the consecutive run. A quiet site must not alert at startup. The count treats every status URL and the probe as one NGINX. With separate instances it overestimates the monitor's traffic by a few requests, which errs toward silence.
 
-Track each status URL independently. `STATUS_URL` is required. `STATUS_URLS` adds more. Deduplicate by URL. A practical cap is 8 URLs. Fail validation above that.
+Track each status URL independently. `STATUS_URL` is required. `STATUS_URLS` adds more. Deduplicate by the URL as `new URL(value).href` sees it, so a default port, host case, or a missing path does not poll the same page twice. The normalized URL is the target label. A practical cap is 8 URLs. Fail validation above that.
 
 ## Probe, config test, and pid
 
@@ -120,13 +120,15 @@ Invalid configuration exits 1 before the first fetch.
 
 Accept only an `https` URL whose host is `hooks.slack.com` and whose path starts with `/services/`.
 
-Send one message per alert event. Use a short header prefixed with `[nginx]`, the target label, the UTC timestamp, and the reason. Do not include the webhook URL.
+Send one message per alert event. Use a short header prefixed with `[nginx]`, the target label, the UTC timestamp, and the reason. Do not include the webhook URL. Escape `&`, `<`, and `>` in the target and the reason, because Slack reads them as links and mentions and `nginx -t` stderr can echo config text.
 
-Throttle key is `${target}::${kind}`. While a condition remains true, skip a send when the same key was sent inside `THROTTLE_DURATION_MS`. A recovery for that target and kind deletes the key, so a later incident sends immediately. Recovery messages are not throttled away.
+Throttle key is `${target}::${kind}`. While a condition remains true, skip a send when the same key was sent inside `THROTTLE_DURATION_MS`. A recovery for that target and kind deletes the key, so a later incident sends immediately. Recovery messages are not throttled away. `restart` is an event, not a condition that stays true, so every restart sends and is never throttled. A crash loop still sends at most one restart per target per cycle.
 
 Kinds are `down`, `bad_status_page`, `dropped`, `active`, `waiting`, `stall`, `probe`, `config_test`, and `restart`. Use a stable target label derived from the URL, not from response data.
 
 Slack failure is logged and does not crash the cycle. The history snapshot still records the sample.
+
+A failed incident post is queued in memory and retried on the next cycle, oldest first, because an event such as `restart` or `dropped` is not built again. A newer incident for the same target and kind replaces the queued copy, except `restart`: every queued restart is kept and sent, with at most 10 per target, dropping the oldest. The whole queue is sent before the cycle's new events, oldest first, so a queued incident always precedes the recovery that closes it. While the incident is still undelivered its recovery waits. A late delivery skips the throttle and does not set the throttle key, because its condition may already be closed. A recovery or a release deletes the throttle key even when the recovery post fails, so the next incident is not throttled behind an undelivered recovery. A failed recovery post is not queued; the condition stays open so the next good cycle sends the recovery again. After the first failed post in a cycle, the remaining posts of that cycle are not attempted; they are queued or reopened the same way, so a dead webhook costs one `SLACK_TIMEOUT_MS` per cycle and does not push the cycle past the schedule. A retried message keeps the time the event happened and adds a `delivered late at <UTC time>` line. The queue is not persisted and is lost when the process exits.
 
 ## Status server
 
@@ -140,7 +142,7 @@ Match the pm2-monitor authorization behavior. Reimplement it here. Do not import
 - Other methods and paths answer 404.
 - Responses set `Cache-Control: no-store`.
 - Write history to a temporary file in the same directory, then rename it over `STATUS_LOG_FILE`. Keep at most `MAX_HISTORY` snapshots, newest first.
-- A history snapshot contains the timestamp, per-URL counts, deltas, probe outcome booleans and status codes, config-test and pid-check booleans, and the master pid when known. It does not contain the webhook, the token, response bodies, stderr, request URIs, or client addresses.
+- A history snapshot contains the timestamp, per-URL counts, the elapsed seconds since the previous good sample (`null` on the first baseline), deltas, probe outcome booleans and status codes, config-test and pid-check booleans, and the master pid when known. It does not contain the webhook, the token, response bodies, stderr, request URIs, or client addresses.
 
 ## Configuration parsing
 
@@ -149,8 +151,8 @@ Read `.env` through `dotenv` without overriding variables that are already set.
 - Strings are trimmed. An empty string uses the default.
 - Lists split on commas, then trim, then drop empty items.
 - Booleans accept `1`, `true`, `yes`, and `on`, case-insensitive. Anything else set in the environment is false. An unset variable uses the default.
-- Numbers must be finite and greater than or equal to 0. Anything else uses the default, except a required URL.
-- Validate the cron expression with `cron.validate` before starting.
+- Numbers must be finite and greater than or equal to 0. Decimals are accepted. Anything else uses the default, except a required URL. `PORT` must also be an integer no greater than 65535, or it uses the default. `STATUS_TIMEOUT_MS`, `PROBE_TIMEOUT_MS`, and `SLACK_TIMEOUT_MS` must also be greater than 0 and at most 2147483647, the `setTimeout` limit, or they use the default.
+- `CRON_SCHEDULE` has exactly five fields. node-cron also accepts a seconds field, which would poll NGINX more than once a minute, so a six-field expression fails validation. Validate the expression with `cron.validate` before starting.
 
 Defaults are the values in [.env.example](.env.example) and the table in the README. Do not invent a second set.
 
@@ -160,13 +162,14 @@ Use `node:test` and `node:assert/strict`. No test runner dependency. Tests must 
 
 Cover at least:
 
-- The official `stub_status` sample, extra whitespace, and an HTML body rejected as a bad page.
+- The official `stub_status` sample, extra whitespace including repeated spaces and tabs inside a line, and an HTML body rejected as a bad page.
 - Deltas for a quiet interval, a dropped interval, and a counter reset.
 - URL acceptance for loopback, rejection for a public host, rejection for userinfo, and acceptance of a public host only when the matching allow flag is set.
 - Probe status matching for `200-399` and for a comma-separated list.
-- Throttle: a repeat inside the window is skipped, recovery deletes the key, and the next incident sends.
+- Throttle: a repeat inside the window is skipped, recovery deletes the key, and the next incident sends. A second restart inside the window still sends.
+- Slack retry: one failed post defers the rest of the cycle, a failed restart is retried with its original time, a second restart does not replace a queued one, the restart queue is capped, and a queued incident is sent before its recovery.
 - Authorization: loopback with no token, non-loopback with no token, a matching bearer token, a wrong bearer token, and a token supplied only as a query string.
-- Stall detection stays quiet before the first busy sample and when the feature is disabled.
+- Stall detection stays quiet before the first busy sample and when the feature is disabled, treats the monitor's own requests as quiet, and restarts the consecutive count after a `down` sample.
 
 Do not add a test that calls `hooks.slack.com`.
 
