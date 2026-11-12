@@ -5,6 +5,7 @@ import cron from 'node-cron';
 import { isLoopbackHost, loadConfig } from './src/config.js';
 import {
   decideConfigTest,
+  decideLag,
   decidePid,
   decideProbe,
   decideUrl,
@@ -13,7 +14,7 @@ import {
 } from './src/decide.js';
 import { readHistoryFile, writeHistory } from './src/history.js';
 import { readPidFile, runNginxTest } from './src/nginx-cmd.js';
-import { fetchProbe } from './src/probe.js';
+import { fetchProbe, stripUserinfo } from './src/probe.js';
 import {
   formatAlert,
   gateAlert,
@@ -35,6 +36,8 @@ export function createContext(config, overrides = {}) {
     sent: {},
     undelivered: {},
     running: false,
+    skippedCycles: 0,
+    lagOpen: false,
     now: () => Date.now(),
     fetchImpl: globalThis.fetch,
     ...overrides,
@@ -50,10 +53,28 @@ function reopen(ctx, event) {
   if (event.scope === 'probe') ctx.probeOpen = true;
   if (event.scope === 'nginx-test') ctx.configTestOpen = true;
   if (event.scope === 'pid') ctx.pidState = { ...ctx.pidState, open: true };
+  if (event.scope === 'monitor') ctx.lagOpen = true;
+}
+
+export function openConditions(ctx) {
+  const open = [];
+  for (const [url, state] of ctx.urlStates) {
+    for (const [kind, isOpen] of Object.entries(state.open ?? {})) {
+      if (isOpen) open.push({ target: url, kind });
+    }
+  }
+  if (ctx.probeOpen && ctx.config.probeUrl) {
+    open.push({ target: stripUserinfo(ctx.config.probeUrl), kind: 'probe' });
+  }
+  if (ctx.configTestOpen) open.push({ target: 'nginx', kind: 'config_test' });
+  if (ctx.pidState?.open) open.push({ target: 'nginx-pid', kind: 'config_test' });
+  if (ctx.lagOpen) open.push({ target: 'nginx-monitor', kind: 'lag' });
+  return open;
 }
 
 export async function runCycle(ctx) {
   if (ctx.running) {
+    ctx.skippedCycles += 1;
     console.log('skipping cycle; previous cycle is still running');
     return;
   }
@@ -68,7 +89,11 @@ export async function runCycle(ctx) {
 async function runCycleBody(ctx) {
   const at = ctx.now();
   const { config } = ctx;
-  const events = [];
+  const skipped = ctx.skippedCycles ?? 0;
+  ctx.skippedCycles = 0;
+  const lag = decideLag(Boolean(ctx.lagOpen), skipped, config.skippedCyclesMin ?? 0);
+  ctx.lagOpen = lag.open;
+  const events = [...lag.events];
   const statuses = [];
   const observations = await Promise.all(config.statusUrls.map(async (url) => {
     const result = await fetchStubStatus(url, {
@@ -183,6 +208,9 @@ async function runCycleBody(ctx) {
     configTestOk,
     pidCheckOk,
     masterPid,
+    skippedCycles: skipped,
+    undelivered: Object.keys(ctx.undelivered ?? {}).length,
+    open: openConditions(ctx),
   }, config.maxHistory, ctx.historyFs);
 
   if (sentCount > 0) console.log(`sent ${sentCount} slack message(s)`);
@@ -227,19 +255,23 @@ async function listenStatusServer(config) {
   return server;
 }
 
-export async function stop({ server, task, ctx, timeoutMs = 5000 } = {}) {
+// A stuck cycle must not hold SIGTERM until systemd sends SIGKILL.
+export const SHUTDOWN_WAIT_MS = 30_000;
+
+export async function stop({ server, task, ctx, timeoutMs = SHUTDOWN_WAIT_MS } = {}) {
   if (task && typeof task.stop === 'function') {
     task.stop();
-  }
-  if (server && typeof server.close === 'function') {
-    server.closeAllConnections?.();
-    await new Promise((resolve) => server.close(() => resolve()));
   }
   if (ctx && ctx.running) {
     const startWait = Date.now();
     while (ctx.running && Date.now() - startWait < timeoutMs) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    if (ctx.running) console.error('shutdown timed out while a cycle was still running');
+  }
+  if (server && typeof server.close === 'function') {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(() => resolve()));
   }
 }
 

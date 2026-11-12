@@ -3,34 +3,46 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import { registerSignalHandlers, stop } from '../nginx-monitor.js';
 
-test('stop calls task.stop, server.close, and waits for running cycle', async () => {
-  let taskStopped = false;
-  let serverClosed = false;
+test('stop calls task.stop, waits for the running cycle, then closes the server', async () => {
+  const order = [];
 
   const task = {
     stop() {
-      taskStopped = true;
+      order.push('task');
     },
   };
 
   const server = {
     close(callback) {
-      serverClosed = true;
+      order.push('close');
       callback();
     },
   };
 
   const ctx = { running: true };
 
-  // Release running after 30 ms
   setTimeout(() => {
+    order.push('cycle-finished');
     ctx.running = false;
   }, 30);
 
   await stop({ server, task, ctx, timeoutMs: 1000 });
-  assert.equal(taskStopped, true);
-  assert.equal(serverClosed, true);
+  assert.deepEqual(order, ['task', 'cycle-finished', 'close']);
   assert.equal(ctx.running, false);
+});
+
+test('stop closes the server when the cycle is still running at the timeout', async () => {
+  let closed = false;
+  const server = {
+    close(callback) {
+      closed = true;
+      callback();
+    },
+  };
+  const ctx = { running: true };
+  await stop({ server, ctx, timeoutMs: 20 });
+  assert.equal(closed, true);
+  assert.equal(ctx.running, true);
 });
 
 test('stop handles empty arguments gracefully', async () => {

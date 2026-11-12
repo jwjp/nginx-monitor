@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ConfigError, loadConfig, validateFetchUrl } from '../src/config.js';
+import { ConfigError, loadConfig, ownRequestCounts, validateFetchUrl } from '../src/config.js';
 
 const WEBHOOK = 'https://hooks.slack.com/services/T/B/X';
 
@@ -87,12 +87,24 @@ test('accepts a finite decimal number and keeps PORT an integer port', () => {
   assert.equal(loadConfig(env({ PORT: '8080' })).port, 8080);
 });
 
-test('counts the monitor own requests per cycle for stall detection', () => {
-  assert.equal(loadConfig(env()).ownRequestsPerCycle, 1);
-  assert.equal(loadConfig(env({
+test('counts the monitor own requests per status origin', () => {
+  const same = loadConfig(env({
     STATUS_URLS: 'http://127.0.0.1/a',
     PROBE_URL: 'http://127.0.0.1/health',
-  })).ownRequestsPerCycle, 3);
+  }));
+  assert.equal(same.ownRequestsByUrl['http://127.0.0.1/nginx_status'], 3);
+  assert.equal(same.ownRequestsByUrl['http://127.0.0.1/a'], 3);
+
+  const split = ownRequestCounts(
+    ['http://127.0.0.1/nginx_status', 'http://127.0.0.1:8080/nginx_status'],
+    'http://127.0.0.1:8080/health',
+  );
+  assert.equal(split['http://127.0.0.1/nginx_status'], 1);
+  assert.equal(split['http://127.0.0.1:8080/nginx_status'], 2);
+  assert.equal(loadConfig(env()).readingConnectionsThreshold, 0);
+  assert.equal(loadConfig(env()).writingConnectionsThreshold, 0);
+  assert.equal(loadConfig(env()).skippedCyclesMin, 1);
+  assert.equal(loadConfig(env({ SKIPPED_CYCLES_MIN: '0' })).skippedCyclesMin, 0);
 });
 
 test('rejects a six-field cron expression', () => {

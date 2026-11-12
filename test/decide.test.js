@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { decidePid, decideUrl, initialPidState, initialUrlState } from '../src/decide.js';
+import { decideLag, decidePid, decideUrl, initialPidState, initialUrlState } from '../src/decide.js';
 
 const URL = 'http://127.0.0.1/nginx_status';
 
@@ -82,11 +82,30 @@ test('the first good sample can alert on active connections and not on dropped',
 test('a zero threshold disables active and waiting alerts', () => {
   const decided = decideUrl(
     initialUrlState(),
-    { type: 'ok', url: URL, sample: sample({ active: 100, waiting: 100 }) },
+    { type: 'ok', url: URL, sample: sample({ active: 100, waiting: 100, reading: 100, writing: 100 }) },
     config(),
     0,
   );
   assert.deepEqual(kinds(decided.events), []);
+});
+
+test('reading and writing thresholds alert on the first sample and recover below it', () => {
+  const limits = config({ readingConnectionsThreshold: 4, writingConnectionsThreshold: 4 });
+  const high = decideUrl(
+    initialUrlState(),
+    { type: 'ok', url: URL, sample: sample({ reading: 4, writing: 9 }) },
+    limits,
+    0,
+  );
+  assert.deepEqual(kinds(high.events), ['reading', 'writing']);
+  const low = decideUrl(
+    high.state,
+    { type: 'ok', url: URL, sample: sample({ reading: 1, writing: 1, requests: 101 }) },
+    limits,
+    60_000,
+  );
+  assert.equal(low.events.some((event) => event.kind === 'reading' && event.recovery), true);
+  assert.equal(low.events.some((event) => event.kind === 'writing' && event.recovery), true);
 });
 
 test('stall stays quiet before the first busy sample and when disabled', () => {
@@ -186,4 +205,33 @@ test('stall ignores the monitor own requests and a down sample breaks the quiet 
   // and the down sample restarted the consecutive count.
   assert.deepEqual(step(2), ['down']);
   assert.deepEqual(step(1), ['stall']);
+});
+
+test('stall quiet budget follows this URL origin and ignores a larger global count', () => {
+  const enabled = config({
+    requestStallEnabled: true,
+    requestStallWindows: 1,
+    ownRequestsByUrl: { [URL]: 1 },
+    ownRequestsPerCycle: 5,
+  });
+  let state = initialUrlState();
+  ({ state } = decideUrl(state, { type: 'ok', url: URL, sample: sample({ requests: 10 }) }, enabled, 0));
+  const busy = decideUrl(state, { type: 'ok', url: URL, sample: sample({ requests: 12 }) }, enabled, 60_000);
+  assert.deepEqual(kinds(busy.events), []);
+  assert.equal(busy.state.seenBusySample, true);
+  const stall = decideUrl(busy.state, { type: 'ok', url: URL, sample: sample({ requests: 13 }) }, enabled, 120_000);
+  assert.deepEqual(kinds(stall.events), ['stall']);
+});
+
+test('lag alerts once the skipped count reaches the minimum and recovers at zero', () => {
+  assert.deepEqual(decideLag(false, 0, 1).events, []);
+  assert.deepEqual(decideLag(false, 3, 0).events, []);
+  const open = decideLag(false, 2, 1);
+  assert.equal(open.open, true);
+  assert.equal(open.events[0].kind, 'lag');
+  assert.equal(open.events[0].target, 'nginx-monitor');
+  assert.match(open.events[0].reason, /skipped 2/);
+  const recovered = decideLag(true, 0, 1);
+  assert.equal(recovered.open, false);
+  assert.equal(recovered.events[0].recovery, true);
 });

@@ -109,6 +109,14 @@ test('a cycle records history and sends slack without calling hooks.slack.com', 
     assert.equal(history[0].configTestOk, true);
     assert.equal(history[0].pidCheckOk, true);
     assert.equal(history[0].masterPid, 42);
+    assert.equal(history[0].skippedCycles, 0);
+    assert.equal(history[0].undelivered, 0);
+    assert.deepEqual(history[0].open, [
+      { target: `http://127.0.0.1:${stub.port}/nginx_status`, kind: 'bad_status_page' },
+      { target: `http://127.0.0.1:${stub.port}/nginx_status`, kind: 'dropped' },
+      { target: `http://127.0.0.1:${probe.port}/health`, kind: 'probe' },
+    ]);
+    assert.equal(JSON.stringify(history[0].open).includes('syntax'), false);
     assert.equal(history.length, 3);
   } finally {
     await stub.close();
@@ -171,6 +179,31 @@ async function withStatus(options, run) {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test('a skipped cycle is reported by the next completed cycle and then recovers', async () => {
+  await withStatus(async ({ ctx, slack, historyFile, advance }) => {
+    await runCycle(ctx);
+    ctx.running = true;
+    await runCycle(ctx);
+    await runCycle(ctx);
+    ctx.running = false;
+    slack.length = 0;
+    advance();
+    await runCycle(ctx);
+    assert.equal(slack.some((text) => text.includes(' lag\n') && text.includes('skipped 2')), true);
+    const history = JSON.parse(await readFile(historyFile, 'utf8'));
+    assert.equal(history[0].skippedCycles, 2);
+    assert.equal(history[0].open.some((item) => item.kind === 'lag' && item.target === 'nginx-monitor'), true);
+
+    slack.length = 0;
+    advance();
+    await runCycle(ctx);
+    assert.equal(slack.some((text) => text.includes('lag recovered')), true);
+    const recovered = JSON.parse(await readFile(historyFile, 'utf8'));
+    assert.equal(recovered[0].skippedCycles, 0);
+    assert.equal(recovered[0].open.some((item) => item.kind === 'lag'), false);
+  });
+});
 
 test('a failed restart post is retried without rolling the baseline back', async () => {
   await withStatus(async ({ ctx, slack, statusUrl, historyFile, setBody, setFailSlack, advance }) => {

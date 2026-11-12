@@ -13,6 +13,8 @@ export function initialUrlState() {
       dropped: false,
       active: false,
       waiting: false,
+      reading: false,
+      writing: false,
       stall: false,
     },
   };
@@ -79,6 +81,22 @@ function evaluateGauges(next, events, counts, config, target, url) {
     target,
     url,
   });
+  evaluateGauge(next, events, {
+    kind: 'reading',
+    threshold: config.readingConnectionsThreshold,
+    value: counts.reading,
+    label: 'reading connections',
+    target,
+    url,
+  });
+  evaluateGauge(next, events, {
+    kind: 'writing',
+    threshold: config.writingConnectionsThreshold,
+    value: counts.writing,
+    label: 'writing connections',
+    target,
+    url,
+  });
 }
 
 function evaluateGauge(next, events, { kind, threshold, value, label, target, url }) {
@@ -92,8 +110,12 @@ function evaluateGauge(next, events, { kind, threshold, value, label, target, ur
 
 // Every stub_status fetch and every probe is itself counted in `requests`, so
 // a delta at or below the monitor's own traffic means no outside request.
-function ownRequests(next, config) {
-  return (config.ownRequestsPerCycle ?? 0) * (next.missedCycles + 1);
+function ownRequests(next, config, url) {
+  const table = config.ownRequestsByUrl;
+  const perCycle = table && Object.prototype.hasOwnProperty.call(table, url)
+    ? table[url]
+    : (config.ownRequestsPerCycle ?? 0);
+  return perCycle * (next.missedCycles + 1);
 }
 
 function evaluateStall(next, events, requestsDelta, config, target, url) {
@@ -102,7 +124,7 @@ function evaluateStall(next, events, requestsDelta, config, target, url) {
     next.quietSamples = 0;
     return;
   }
-  if (requestsDelta > ownRequests(next, config)) {
+  if (requestsDelta > ownRequests(next, config, url)) {
     next.seenBusySample = true;
     next.quietSamples = 0;
     clearFailure(next, events, 'stall', target, url, 'requests are moving');
@@ -237,6 +259,38 @@ export function decideUrl(state, observation, config, at) {
       },
     },
   };
+}
+
+export function decideLag(open, skipped, min) {
+  if (min > 0 && skipped >= min) {
+    return {
+      open: true,
+      events: [{
+        scope: 'monitor',
+        kind: 'lag',
+        target: 'nginx-monitor',
+        recovery: false,
+        release: false,
+        once: false,
+        reason: `skipped ${skipped} cycle(s) because the previous cycle was still running`,
+      }],
+    };
+  }
+  if (open) {
+    return {
+      open: false,
+      events: [{
+        scope: 'monitor',
+        kind: 'lag',
+        target: 'nginx-monitor',
+        recovery: true,
+        release: false,
+        once: false,
+        reason: 'cycles are keeping up',
+      }],
+    };
+  }
+  return { open: false, events: [] };
 }
 
 export function decideProbe(open, result, url) {

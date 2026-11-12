@@ -14,6 +14,9 @@ export const DEFAULTS = {
   droppedConnectionsMin: 1,
   requestStallEnabled: false,
   requestStallWindows: 5,
+  readingConnectionsThreshold: 0,
+  writingConnectionsThreshold: 0,
+  skippedCyclesMin: 1,
   probeTimeoutMs: 5000,
   allowRemoteProbe: false,
   probeAcceptedStatuses: '200-399',
@@ -146,6 +149,21 @@ function readStatusUrls(env) {
   return urls;
 }
 
+// One NGINX shares a request counter across every fetch to the same origin.
+// A different origin has a different counter, so those fetches are not this URL's quiet budget.
+export function ownRequestCounts(statusUrls, probeUrl) {
+  const perOrigin = new Map();
+  const add = (value) => {
+    const origin = new URL(value).origin;
+    perOrigin.set(origin, (perOrigin.get(origin) ?? 0) + 1);
+  };
+  for (const url of statusUrls) add(url);
+  if (probeUrl) add(probeUrl);
+  const byUrl = {};
+  for (const url of statusUrls) byUrl[url] = perOrigin.get(new URL(url).origin);
+  return byUrl;
+}
+
 function assertTimezone(value) {
   try {
     Intl.DateTimeFormat('en-US', { timeZone: value }).format(0);
@@ -200,7 +218,7 @@ export function loadConfig(env) {
     throw new ConfigError('PROBE_ACCEPTED_STATUSES must be a status, a list, or a range.');
   }
 
-  const ownRequestsPerCycle = statusUrls.length + (probeUrl ? 1 : 0);
+  const ownRequestsByUrl = ownRequestCounts(statusUrls, probeUrl);
   const nginxPidRaw = readString(env, 'NGINX_PID_FILE', '');
   const host = normalizeHost(readString(env, 'HOST', DEFAULTS.host));
 
@@ -216,7 +234,10 @@ export function loadConfig(env) {
     droppedConnectionsMin: readNumber(env, 'DROPPED_CONNECTIONS_MIN', DEFAULTS.droppedConnectionsMin),
     requestStallEnabled: readBoolean(env, 'REQUEST_STALL_ENABLED', DEFAULTS.requestStallEnabled),
     requestStallWindows: readNumber(env, 'REQUEST_STALL_WINDOWS', DEFAULTS.requestStallWindows),
-    ownRequestsPerCycle,
+    readingConnectionsThreshold: readNumber(env, 'READING_CONNECTIONS_THRESHOLD', DEFAULTS.readingConnectionsThreshold),
+    writingConnectionsThreshold: readNumber(env, 'WRITING_CONNECTIONS_THRESHOLD', DEFAULTS.writingConnectionsThreshold),
+    skippedCyclesMin: readNumber(env, 'SKIPPED_CYCLES_MIN', DEFAULTS.skippedCyclesMin),
+    ownRequestsByUrl,
     probeUrl,
     probeTimeoutMs: readTimeout(env, 'PROBE_TIMEOUT_MS', DEFAULTS.probeTimeoutMs),
     allowRemoteProbe,

@@ -59,9 +59,9 @@ Alert decisions, `stub_status` parsing, URL checks, throttle transitions, and to
 1. Validate configuration. On failure, log a short message and exit 1. Do not start the timer.
 2. Unless `RUN_ONCE` is set, start the status server when `WEB_ENABLED` is true.
 3. Take one sample immediately, then schedule the cycle.
-4. A cycle fetches every status URL, updates deltas, optionally probes, optionally runs `nginx -t`, optionally reads the pid file, decides alerts, sends Slack, and appends one history snapshot.
+4. A cycle fetches every status URL, updates deltas, optionally probes, optionally runs `nginx -t`, optionally reads the pid file, decides alerts, sends Slack, and appends one history snapshot. If a cycle is still running when the next one is due, count a skip and return without fetching. The skip is reported by the next cycle that runs.
 5. A finished cycle is success even when NGINX is down. Exit 1 only for invalid configuration, an uncaught exception, or a `RUN_ONCE` cycle that throws. `RUN_ONCE` still exits 0 when the cycle completes and alerts were sent.
-6. On `SIGINT` or `SIGTERM`, stop the cron timer, wait for any in-flight cycle to complete, close the status server, and exit 0.
+6. On `SIGINT` or `SIGTERM`, stop the cron timer, wait up to 30 seconds for any in-flight cycle to complete, close the status server, and exit 0. A cycle still running after that wait does not block exit.
 7. Log the schedule, time zone, status URLs, and which optional checks are enabled. Never log the webhook, the status token, or a URL userinfo field.
 
 ## stub_status
@@ -91,9 +91,11 @@ If any cumulative counter moves backward, or the new accepts value is less than 
 
 `dropped = delta(accepts) - delta(handled)`. Alert `dropped` when `dropped >= DROPPED_CONNECTIONS_MIN` and the minimum is greater than 0.
 
-Alert `active` when the threshold is greater than 0 and `active >= threshold`. Alert `waiting` the same way. Reading and writing are stored in history and are not alert conditions in v1.
+Alert `active` when the threshold is greater than 0 and `active >= threshold`. Alert `waiting`, `reading`, and `writing` the same way. A threshold of 0 disables that alert. The first good sample can raise these gauge alerts.
 
-`REQUEST_STALL_ENABLED` defaults to false. NGINX counts every request it serves, including the monitor's own `stub_status` fetches and probe, so a request delta of 0 never happens on a polled host. The monitor's own requests per cycle are the number of status URLs plus 1 when `PROBE_URL` is set. A good sample is quiet when its request delta is at most that number times the cycles since the previous good sample. When the feature is true, alert only after `REQUEST_STALL_WINDOWS` consecutive quiet good samples, and only after this process has already seen a busy sample whose request delta is above that number. A `down` or `bad_status_page` sample breaks the consecutive run. A quiet site must not alert at startup. The count treats every status URL and the probe as one NGINX. With separate instances it overestimates the monitor's traffic by a few requests, which errs toward silence.
+`REQUEST_STALL_ENABLED` defaults to false. NGINX counts every request it serves, including the monitor's own `stub_status` fetches and probe, so a request delta of 0 never happens on a polled host. For each status URL, the monitor's own requests per cycle are the status fetches whose origin (scheme, host, and port) matches that URL, plus 1 when `PROBE_URL` has the same origin. A good sample is quiet when its request delta is at most that number times the cycles since the previous good sample. When the feature is true, alert only after `REQUEST_STALL_WINDOWS` consecutive quiet good samples, and only after this process has already seen a busy sample whose request delta is above that number. A `down` or `bad_status_page` sample breaks the consecutive run. A quiet site must not alert at startup. Two status URLs on one origin still share a counter. A fetch to a different origin does not increase this URL's quiet budget.
+
+`SKIPPED_CYCLES_MIN` defaults to 1. When a later cycle finds at least that many skipped cycles since the previous completed cycle, emit `lag` with target `nginx-monitor`. The next completed cycle that sees zero skips emits the recovery. `0` disables the alert. The skipped cycle itself does not send, because sending from it would stack another Slack timeout on the cycle that is still running.
 
 Track each status URL independently. `STATUS_URL` is required. `STATUS_URLS` adds more. Deduplicate by the URL as `new URL(value).href` sees it, so a default port, host case, or a missing path does not poll the same page twice. The normalized URL is the target label. A practical cap is 8 URLs. Fail validation above that.
 
@@ -125,7 +127,7 @@ Send one message per alert event. Use a short header prefixed with `[nginx]`, th
 
 Throttle key is `${target}::${kind}`. While a condition remains true, skip a send when the same key was sent inside `THROTTLE_DURATION_MS`. A recovery for that target and kind deletes the key, so a later incident sends immediately. Recovery messages are not throttled away. `restart` is an event, not a condition that stays true, so every restart sends and is never throttled. A crash loop still sends at most one restart per target per cycle.
 
-Kinds are `down`, `bad_status_page`, `dropped`, `active`, `waiting`, `stall`, `probe`, `config_test`, and `restart`. Use a stable target label derived from the URL, not from response data.
+Kinds are `down`, `bad_status_page`, `dropped`, `active`, `waiting`, `reading`, `writing`, `stall`, `probe`, `config_test`, `restart`, and `lag`. Use a stable target label derived from the URL, not from response data. `lag` uses the fixed target `nginx-monitor`.
 
 Slack failure is logged and does not crash the cycle. The history snapshot still records the sample.
 
@@ -143,7 +145,7 @@ Match the pm2-monitor authorization behavior. Reimplement it here. Do not import
 - Other methods and paths answer 404.
 - Responses set `Cache-Control: no-store`.
 - Write history to a temporary file in the same directory, then rename it over `STATUS_LOG_FILE`. Keep at most `MAX_HISTORY` snapshots, newest first.
-- A history snapshot contains the timestamp, per-URL counts, the elapsed seconds since the previous good sample (`null` on the first baseline), deltas, probe outcome booleans and status codes, config-test and pid-check booleans, and the master pid when known. It does not contain the webhook, the token, response bodies, stderr, request URIs, or client addresses.
+- A history snapshot contains the timestamp, per-URL counts, the elapsed seconds since the previous good sample (`null` on the first baseline), deltas, probe outcome booleans and status codes, config-test and pid-check booleans, the master pid when known, the skipped-cycle count since the previous completed cycle, the number of Slack messages still queued, and the open conditions as `{ target, kind }` pairs. It does not contain the webhook, the token, response bodies, stderr, alert reasons, request URIs, or client addresses.
 
 ## Configuration parsing
 
@@ -171,7 +173,11 @@ Cover at least:
 - Slack retry: one failed post defers the rest of the cycle, a failed restart is retried with its original time, a second restart does not replace a queued one, the restart queue is capped, and a queued incident is sent before its recovery.
 - Authorization: loopback with no token, non-loopback with no token, a matching bearer token, a wrong bearer token, and a token supplied only as a query string.
 - Status history slicing with an optional `limit` query parameter.
-- Graceful shutdown stops the cron timer, closes the server, and waits for a running cycle.
+- Graceful shutdown stops the cron timer, waits for a running cycle, then closes the server. A cycle still running at the wait limit does not block the close.
+- Reading and writing thresholds alert the same way as active and waiting, and a threshold of 0 disables them.
+- Stall own-request counts follow the status URL origin, so a fetch to a different origin is not quiet traffic for this URL.
+- A skipped cycle is counted, the next completed cycle alerts `lag` when the count reaches the minimum, and a later cycle with no skips recovers.
+- A snapshot records open conditions, the undelivered count, and skipped cycles, without the webhook or alert text.
 - Stall detection stays quiet before the first busy sample and when the feature is disabled, treats the monitor's own requests as quiet, and restarts the consecutive count after a `down` sample.
 
 Do not add a test that calls `hooks.slack.com`.

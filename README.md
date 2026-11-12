@@ -31,16 +31,17 @@ On each scheduled cycle the runtime:
 - Fetches `stub_status`. A failed fetch, a redirect, a non-200 response, a timeout, or an oversized body raises a down alert. A 200 body that is not `stub_status` raises a bad-page alert. The next good sample raises a recovery alert for that condition.
 - Compares counters with the previous good sample. Counters that move backward mean NGINX restarted. That sample becomes the new baseline, and the cycle reports the restart.
 - Alerts when accepted connections in the interval exceed handled connections by `DROPPED_CONNECTIONS_MIN`.
-- Alerts when active connections or waiting connections cross an operator threshold. Both default to off. The useful number depends on `worker_processes` and `worker_connections`.
+- Alerts when active, waiting, reading, or writing connections cross an operator threshold. All four default to off. The useful number depends on `worker_processes` and `worker_connections`.
 - Optionally requests one probe URL and alerts on a redirect, a transport error, or a status outside the accepted set. A redirect fails even when its status is inside the default `200-399`.
 - Optionally runs `nginx -t` and reads the master pid file. Both stay off unless configured, so the process can run without root.
-- Appends the sample to a local history file and serves that file on loopback.
+- Counts a skip when a new cycle is due while the previous one is still running. The next cycle that finishes alerts `lag` once the skipped count reaches `SKIPPED_CYCLES_MIN`. The default is 1, and `0` turns it off. The skipped cycle does not itself call Slack.
+- Appends the sample to a local history file and serves that file on loopback. Each snapshot also records how many cycles were skipped, how many Slack messages are still queued, and which conditions are open.
 
 A condition that remains true is throttled. A recovery clears that throttle, so the next incident alerts immediately. A restart is an event, not a condition, so every restart alerts.
 
 If Slack rejects or times out an incident post, the alert is kept in memory and retried on the next cycle, with its original time and a `delivered late at` line. If the condition is still true on that cycle, the new alert replaces the queued one and carries the new time. Restarts are never merged, and up to 10 per target wait for delivery. After one failed post, the rest of that cycle's posts wait too, so an unreachable Slack does not slow the sampling. A failed recovery post is not queued: the next good cycle sends a fresh recovery, and if the condition returns first, the new incident alerts without waiting for the throttle. The queue does not survive a process restart.
 
-A completed cycle exits successfully even when NGINX is down. The down state is a Slack alert. The process stays up so systemd does not restart-loop on the condition it is reporting. `RUN_ONCE=true` is the one-shot form for a smoke test. On `SIGINT` or `SIGTERM`, the process stops the cron schedule, waits for any in-flight cycle to finish, closes the status server, and exits cleanly.
+A completed cycle exits successfully even when NGINX is down. The down state is a Slack alert. The process stays up so systemd does not restart-loop on the condition it is reporting. `RUN_ONCE=true` is the one-shot form for a smoke test. On `SIGINT` or `SIGTERM`, the process stops the cron schedule, waits up to 30 seconds for any in-flight cycle to finish, closes the status server, and exits cleanly.
 
 ## Requirements
 
@@ -98,9 +99,11 @@ Connection limits come from the NGINX configuration. With 4 workers and `worker_
 ```env
 ACTIVE_CONNECTIONS_THRESHOLD=2800
 WAITING_CONNECTIONS_THRESHOLD=2000
+READING_CONNECTIONS_THRESHOLD=0
+WRITING_CONNECTIONS_THRESHOLD=0
 ```
 
-A threshold of `0` turns that alert off. Raise `DROPPED_CONNECTIONS_MIN` if a single dropped connection is too noisy for the host.
+A threshold of `0` turns that alert off. Raise `DROPPED_CONNECTIONS_MIN` if a single dropped connection is too noisy for the host. `SKIPPED_CYCLES_MIN=0` turns off the alert that a cycle overlapped the previous one.
 
 Narrow the schedule when a quiet window is intentional:
 
@@ -120,10 +123,13 @@ CRON_TIMEZONE=America/New_York
 | `STATUS_TIMEOUT_MS` | `5000` | Status fetch timeout. `0` or a value above 2147483647 uses the default. |
 | `CRON_SCHEDULE` | `* * * * *` | Five-field node-cron schedule. A seconds field is rejected. |
 | `CRON_TIMEZONE` | `UTC` | Time zone for the schedule. Alert timestamps are UTC. |
+| `SKIPPED_CYCLES_MIN` | `1` | Alert when a later cycle finds at least this many skipped cycles. `0` disables it. |
 | `ACTIVE_CONNECTIONS_THRESHOLD` | `0` | Active-connection alert. `0` disables it. |
 | `WAITING_CONNECTIONS_THRESHOLD` | `0` | Waiting-connection alert. `0` disables it. |
+| `READING_CONNECTIONS_THRESHOLD` | `0` | Reading-connection alert. `0` disables it. |
+| `WRITING_CONNECTIONS_THRESHOLD` | `0` | Writing-connection alert. `0` disables it. |
 | `DROPPED_CONNECTIONS_MIN` | `1` | Minimum dropped connections in one interval. `0` disables it. |
-| `REQUEST_STALL_ENABLED` | `false` | Alert when only the monitor's own requests move the request counter. |
+| `REQUEST_STALL_ENABLED` | `false` | Alert when only the monitor's own requests to that origin move the request counter. |
 | `REQUEST_STALL_WINDOWS` | `5` | Consecutive quiet good samples required for a stall alert. |
 | `PROBE_URL` | empty | Optional URL requested through NGINX. |
 | `PROBE_TIMEOUT_MS` | `5000` | Probe timeout. Same limits as the status timeout. |
@@ -190,7 +196,7 @@ On a host that already uses PM2, an optional ecosystem file may supervise the sa
 - Keep the Slack webhook out of git, logs, and Slack message text.
 - Serve `stub_status` on localhost only. The monitor refuses a non-loopback status or probe URL unless the matching allow flag is set.
 - Status fetches and probes do not follow redirects.
-- The history file stores counts, deltas, probe status codes, check booleans, and the master pid when known. It does not store request URIs, client addresses, command output, or the webhook.
+- The history file stores counts, deltas, probe status codes, check booleans, the master pid when known, skipped cycles, the queued Slack count, and open conditions as target and kind. It does not store request URIs, client addresses, command output, alert text, or the webhook.
 - The monitor never reloads or restarts NGINX.
 - Run the process as an unprivileged user that can read the status page.
 
